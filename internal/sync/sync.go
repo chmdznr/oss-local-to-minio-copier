@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -26,23 +28,40 @@ type Scanner struct {
 }
 
 type scanProgress struct {
-	TotalFiles   int64
-	TotalSize    int64
-	CurrentFiles int64
-	mu           sync.Mutex
+	CurrentFiles   int64
+	TotalSize      int64
+	NewFiles       int64
+	ModifiedFiles  int64
+	RequeueFiles   int64
+	UnchangedFiles int64
+	sync.Mutex
 }
 
-func (p *scanProgress) Update(size int64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func (p *scanProgress) Update(size int64, isNew, isModified, isRequeue bool) {
+	p.Lock()
+	defer p.Unlock()
 	p.CurrentFiles++
 	p.TotalSize += size
+	if isNew {
+		p.NewFiles++
+	} else if isModified {
+		p.ModifiedFiles++
+	} else if isRequeue {
+		p.RequeueFiles++
+	} else {
+		p.UnchangedFiles++
+	}
 }
 
 func (p *scanProgress) Print() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	fmt.Printf("\rScanned %d files (%s)...", p.CurrentFiles, utils.FormatSize(p.TotalSize))
+	fmt.Printf("\rScanning: %d files (%s) - New: %d, Modified: %d, Requeued: %d, Unchanged: %d",
+		p.CurrentFiles,
+		utils.FormatSize(p.TotalSize),
+		p.NewFiles,
+		p.ModifiedFiles,
+		p.RequeueFiles,
+		p.UnchangedFiles,
+	)
 }
 
 // ScannerConfig holds configuration for the scanner
@@ -114,19 +133,46 @@ func (s *Scanner) ScanFiles() error {
 					return
 				}
 
+				// Check if file exists in database
+				existingFile, err := s.db.GetFileByPath(s.project.Name, relPath)
+				if err != nil {
+					errorChan <- fmt.Errorf("failed to check file in database: %v", err)
+					return
+				}
+
+				isNew := existingFile == nil
+				isModified := false
+				isRequeue := false
+				uploadStatus := "pending"
+
+				if !isNew {
+					// Check if file needs to be requeued (exists but not successfully uploaded)
+					if existingFile.UploadStatus != "uploaded" {
+						isRequeue = true
+					} else {
+						// Check if file is modified by comparing timestamps and size
+						isModified = info.ModTime().After(existingFile.Timestamp) || info.Size() != existingFile.Size
+						if !isModified {
+							uploadStatus = existingFile.UploadStatus
+						}
+					}
+				}
+
 				record := models.FileRecord{
 					FilePath:     relPath,
 					Size:         info.Size(),
 					Timestamp:    info.ModTime(),
-					UploadStatus: "pending",
+					UploadStatus: uploadStatus,
 				}
 
-				progress.Update(info.Size())
+				progress.Update(info.Size(), isNew, isModified, isRequeue)
 				if progress.CurrentFiles%1000 == 0 {
 					progress.Print()
 				}
 
-				recordChan <- record
+				if isNew || isModified || isRequeue {
+					recordChan <- record
+				}
 			}(path, d)
 		}
 		return nil
@@ -144,9 +190,13 @@ func (s *Scanner) ScanFiles() error {
 		return fmt.Errorf("scanning error: %v", err)
 	case <-done:
 		progress.Print()
-		fmt.Printf("\nScan completed: %d files (%s)\n",
+		fmt.Printf("\nScan completed: %d total files (%s)\n",
 			progress.CurrentFiles,
 			utils.FormatSize(progress.TotalSize))
+		fmt.Printf("New files: %d\n", progress.NewFiles)
+		fmt.Printf("Modified files: %d\n", progress.ModifiedFiles)
+		fmt.Printf("Requeued files: %d\n", progress.RequeueFiles)
+		fmt.Printf("Unchanged files: %d\n", progress.UnchangedFiles)
 		return nil
 	}
 }
@@ -246,25 +296,44 @@ type syncProgress struct {
 	TotalSize     int64
 	UploadedFiles int64
 	UploadedSize  int64
-	mu            sync.Mutex
+	SkippedFiles  int64
+	SkippedSize   int64
+	RetryFiles    int64
+	RetrySize     int64
+	sync.Mutex
 }
 
-func (p *syncProgress) Update(size int64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func (p *syncProgress) Update(size int64, isRetry bool) {
+	p.Lock()
+	defer p.Unlock()
 	p.UploadedFiles++
 	p.UploadedSize += size
+	if isRetry {
+		p.RetryFiles++
+		p.RetrySize += size
+	}
+}
+
+func (p *syncProgress) Skip(size int64) {
+	p.Lock()
+	defer p.Unlock()
+	p.SkippedFiles++
+	p.SkippedSize += size
 }
 
 func (p *syncProgress) Print() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	percentage := float64(p.UploadedFiles) / float64(p.TotalFiles) * 100
-	fmt.Printf("\rUploaded %d/%d files (%.2f%%) - %s/%s...",
-		p.UploadedFiles, p.TotalFiles,
-		percentage,
+	p.Lock()
+	defer p.Unlock()
+	fmt.Printf("\rProgress: %d/%d files (%s/%s) - Retried: %d (%s) - Skipped: %d (%s)",
+		p.UploadedFiles,
+		p.TotalFiles,
 		utils.FormatSize(p.UploadedSize),
-		utils.FormatSize(p.TotalSize))
+		utils.FormatSize(p.TotalSize),
+		p.RetryFiles,
+		utils.FormatSize(p.RetrySize),
+		p.SkippedFiles,
+		utils.FormatSize(p.SkippedSize),
+	)
 }
 
 // SyncFiles synchronizes pending files using a worker pool
@@ -274,6 +343,7 @@ func (s *Syncer) SyncFiles() error {
 		filePath        string
 		destinationPath string
 		size            int64
+		isRetry         bool
 	}
 
 	jobs := make(chan workItem, s.numWorkers)
@@ -290,14 +360,19 @@ func (s *Syncer) SyncFiles() error {
 		TotalFiles: int64(len(files)),
 	}
 
-	// Calculate total size
+	// Calculate total size and count retries
+	retriesCount := 0
 	for _, file := range files {
 		progress.TotalSize += file.Size
+		if file.UploadStatus == "failed" {
+			retriesCount++
+		}
 	}
 
-	fmt.Printf("Starting sync of %d files (%s)...\n",
+	fmt.Printf("Starting sync of %d files (%s) - %d files being retried...\n",
 		progress.TotalFiles,
-		utils.FormatSize(progress.TotalSize))
+		utils.FormatSize(progress.TotalSize),
+		retriesCount)
 
 	// Start workers
 	var wg sync.WaitGroup
@@ -310,6 +385,19 @@ func (s *Syncer) SyncFiles() error {
 			for job := range jobs {
 				fullPath := filepath.Join(s.project.SourcePath, job.filePath)
 
+				// Check if file still exists
+				if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+					log.Printf("\nSkipping %s: file no longer exists\n", job.filePath)
+					progress.Skip(job.size)
+					progress.Print()
+					
+					// Mark as skipped in database
+					if err := s.db.UpdateFileStatus(s.project.Name, job.filePath, "skipped"); err != nil {
+						log.Printf("\nFailed to update status for %s: %v\n", job.filePath, err)
+					}
+					continue
+				}
+
 				_, err := s.minioClient.FPutObject(
 					context.Background(),
 					s.project.Destination.Bucket,
@@ -319,12 +407,16 @@ func (s *Syncer) SyncFiles() error {
 				)
 
 				if err != nil {
-					fmt.Printf("\nFailed to upload %s: %v", job.filePath, err)
+					log.Printf("\nFailed to upload %s: %v\n", job.filePath, err)
+					// Mark as failed in database
+					if dbErr := s.db.UpdateFileStatus(s.project.Name, job.filePath, "failed"); dbErr != nil {
+						log.Printf("Failed to update status for %s: %v\n", job.filePath, dbErr)
+					}
 					continue
 				}
 
 				completedFiles = append(completedFiles, job.filePath)
-				progress.Update(job.size)
+				progress.Update(job.size, job.isRetry)
 				progress.Print()
 
 				// Update status in batches
@@ -356,7 +448,8 @@ func (s *Syncer) SyncFiles() error {
 		jobs <- workItem{
 			filePath:        file.FilePath,
 			destinationPath: destinationPath,
-			size:            file.Size,
+			size:           file.Size,
+			isRetry:        file.UploadStatus == "failed",
 		}
 	}
 
@@ -368,9 +461,10 @@ func (s *Syncer) SyncFiles() error {
 	case err := <-errors:
 		return err
 	default:
-		fmt.Printf("\nSync completed successfully: %d files (%s) uploaded\n",
-			progress.UploadedFiles,
-			utils.FormatSize(progress.UploadedSize))
+		fmt.Printf("\nSync completed:\n")
+		fmt.Printf("- Uploaded: %d files (%s)\n", progress.UploadedFiles, utils.FormatSize(progress.UploadedSize))
+		fmt.Printf("- Retried: %d files (%s)\n", progress.RetryFiles, utils.FormatSize(progress.RetrySize))
+		fmt.Printf("- Skipped: %d files (%s)\n", progress.SkippedFiles, utils.FormatSize(progress.SkippedSize))
 		return nil
 	}
 }

@@ -4,14 +4,12 @@ A command-line tool for synchronizing local directories with MinIO object storag
 
 ## Features
 
-- Create and manage multiple sync projects
-- Fast parallel file scanning with real-time progress tracking
-- Efficient batch processing for database operations
-- Concurrent file uploads with configurable workers
-- Track file sync status using project-specific SQLite databases
-- Support for custom destination folders within buckets
-- Cross-platform support (Windows paths are automatically converted)
-- Real-time progress reporting for both scanning and syncing operations
+- Fast parallel file scanning and uploading
+- Efficient handling of large files and directories
+- Real-time progress tracking
+- Smart file change detection
+- Automatic retry of failed uploads
+- Detailed status reporting
 
 ## Project Structure
 
@@ -44,77 +42,56 @@ go build -o msync.exe ./cmd/msync
 
 ## Usage
 
-### Create a New Sync Project
-
-Windows:
-```cmd
-msync.exe create --name "project-name" ^
-            --source "D:\path\to\local\directory" ^
-            --endpoint "minio.example.com" ^
-            --bucket "your-bucket" ^
-            --folder "optional/folder/path" ^
-            --access-key "your-access-key" ^
-            --secret-key "your-secret-key"
-```
-
-Unix-like:
-```bash
-./msync create --name "project-name" \
-            --source "/path/to/local/directory" \
-            --endpoint "minio.example.com" \
-            --bucket "your-bucket" \
-            --folder "optional/folder/path" \
-            --access-key "your-access-key" \
-            --secret-key "your-secret-key"
-```
-
-### Scan Files in Project
+### Create a Project
 
 ```bash
-# Basic usage
-msync.exe scan --project "project-name"
-
-# With performance tuning
-msync.exe scan --project "project-name" --workers 8 --batch 2000
+msync create --name <project-name> --source <source-dir> --endpoint <minio-endpoint> --bucket <bucket-name> --folder <dest-folder> --access-key <access-key> --secret-key <secret-key>
 ```
 
-### Start Synchronization
+### Scan Files
 
 ```bash
-# Basic usage
-msync.exe sync --project "project-name"
-
-# With performance tuning
-msync.exe sync --project "project-name" --workers 32 --batch 200
+msync scan --project <project-name> [--workers <num-workers>] [--batch <batch-size>]
 ```
 
-### View Project Status
+The scan command:
+- Detects new files not in the database
+- Identifies modified files by comparing timestamps and sizes
+- Requeues files that weren't successfully uploaded
+- Shows real-time progress including:
+  - New files count and size
+  - Modified files count and size
+  - Requeued files count and size
+  - Unchanged files count and size
+
+### Sync Files
 
 ```bash
-msync.exe status --project "project-name"
+msync sync --project <project-name> [--workers <num-workers>] [--batch <batch-size>]
 ```
 
-## Command Details
+The sync command:
+- Uploads all pending files to MinIO
+- Automatically retries previously failed uploads
+- Skips files that no longer exist
+- Shows real-time progress including:
+  - Upload progress (files and sizes)
+  - Retry attempts
+  - Skipped files
 
-### Create Command
-- Creates a new sync project with specified parameters
+### Show Status
 
-### Scan Command
-- Scans the source directory and updates the project database
-- Shows real-time progress (files scanned and total size)
-- Performance options:
-  - `--workers`: Number of parallel scanner workers (default: 8)
-  - `--batch`: Number of files to process in one database transaction (default: 1000)
+```bash
+msync status --project <project-name>
+```
 
-### Sync Command
-- Synchronizes files from local to MinIO storage
-- Shows real-time progress (files uploaded, percentage, and size)
-- Performance options:
-  - `--workers`: Number of parallel upload workers (default: 16)
-  - `--batch`: Number of files to update in one database transaction (default: 100)
+## File States
 
-### Status Command
-- Shows current project status including pending uploads
+Files can be in one of the following states:
+- `pending`: New, modified, or queued for upload
+- `uploaded`: Successfully uploaded to MinIO
+- `failed`: Upload attempt failed
+- `skipped`: File no longer exists in source directory
 
 ## Performance Tuning
 

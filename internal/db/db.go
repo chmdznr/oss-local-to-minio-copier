@@ -3,8 +3,9 @@ package db
 import (
 	"database/sql"
 	"fmt"
-	_ "github.com/mattn/go-sqlite3"
 	"local-to-minio-copier/pkg/models"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // DB represents a database connection
@@ -99,13 +100,19 @@ func (db *DB) CreateProject(project *models.Project) error {
 	return err
 }
 
-// GetPendingFiles retrieves pending files for a project
+// GetPendingFiles retrieves pending and failed files for a project
 func (db *DB) GetPendingFiles(projectName string) ([]models.FileRecord, error) {
 	rows, err := db.Query(`
-		SELECT file_path, size 
+		SELECT file_path, size, upload_status, timestamp 
 		FROM files 
-		WHERE project_name = ? AND upload_status = 'pending'
-		ORDER BY size DESC
+		WHERE project_name = ? 
+		AND (upload_status = 'pending' OR upload_status = 'failed')
+		ORDER BY 
+			CASE upload_status
+				WHEN 'failed' THEN 1
+				WHEN 'pending' THEN 2
+			END,
+			size DESC
 	`, projectName)
 	if err != nil {
 		return nil, err
@@ -115,7 +122,7 @@ func (db *DB) GetPendingFiles(projectName string) ([]models.FileRecord, error) {
 	var files []models.FileRecord
 	for rows.Next() {
 		var file models.FileRecord
-		err = rows.Scan(&file.FilePath, &file.Size)
+		err = rows.Scan(&file.FilePath, &file.Size, &file.UploadStatus, &file.Timestamp)
 		if err != nil {
 			return nil, err
 		}
@@ -254,4 +261,21 @@ func (db *DB) GetStats(projectName string) (*models.Stats, error) {
 		return nil, fmt.Errorf("failed to get stats: %v", err)
 	}
 	return &stats, nil
+}
+
+// GetFileByPath retrieves a file record by its path
+func (db *DB) GetFileByPath(projectName string, filePath string) (*models.FileRecord, error) {
+	var record models.FileRecord
+	err := db.QueryRow(
+		"SELECT file_path, size, timestamp, upload_status FROM files WHERE project_name = ? AND file_path = ?",
+		projectName, filePath,
+	).Scan(&record.FilePath, &record.Size, &record.Timestamp, &record.UploadStatus)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("error getting file record: %v", err)
+	}
+	return &record, nil
 }
