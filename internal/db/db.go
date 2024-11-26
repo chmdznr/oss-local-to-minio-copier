@@ -47,9 +47,16 @@ func (db *DB) initialize() error {
 			size INTEGER,
 			timestamp DATETIME,
 			upload_status TEXT,
-			PRIMARY KEY (project_name, file_path),
-			FOREIGN KEY (project_name) REFERENCES projects(name)
+			PRIMARY KEY (project_name, file_path)
 		);
+		CREATE INDEX IF NOT EXISTS idx_files_status ON files(project_name, upload_status);
+		CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(project_name, timestamp);
+		PRAGMA journal_mode=WAL;
+		PRAGMA synchronous=NORMAL;
+		PRAGMA temp_store=MEMORY;
+		PRAGMA mmap_size=30000000000;
+		PRAGMA page_size=4096;
+		PRAGMA cache_size=-2000000;
 	`)
 	return err
 }
@@ -134,6 +141,67 @@ func (db *DB) SaveFileRecord(projectName string, record *models.FileRecord) erro
 		VALUES (?, ?, ?, ?, ?)
 	`, projectName, record.FilePath, record.Size, record.Timestamp, record.UploadStatus)
 	return err
+}
+
+// SaveFileRecordsBatch saves multiple file records in a single transaction
+func (db *DB) SaveFileRecordsBatch(projectName string, records []models.FileRecord) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+		INSERT OR REPLACE INTO files (project_name, file_path, size, timestamp, upload_status)
+		VALUES (?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, record := range records {
+		_, err = stmt.Exec(
+			projectName,
+			record.FilePath,
+			record.Size,
+			record.Timestamp,
+			record.UploadStatus,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// UpdateFileStatusBatch updates the status of multiple files in a single transaction
+func (db *DB) UpdateFileStatusBatch(projectName string, filePaths []string, status string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+		UPDATE files 
+		SET upload_status = ? 
+		WHERE project_name = ? AND file_path = ?
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, filePath := range filePaths {
+		_, err = stmt.Exec(status, projectName, filePath)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
 }
 
 // GetFileStats returns statistics about files in the project

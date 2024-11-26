@@ -6,10 +6,11 @@ import (
 	"os"
 	"strings"
 
-	"github.com/urfave/cli/v2"
 	"local-to-minio-copier/internal/db"
 	"local-to-minio-copier/internal/sync"
 	"local-to-minio-copier/pkg/models"
+
+	"github.com/urfave/cli/v2"
 )
 
 func main() {
@@ -68,6 +69,16 @@ func main() {
 						Usage:    "Project name",
 						Required: true,
 					},
+					&cli.IntFlag{
+						Name:  "workers",
+						Usage: "Number of parallel workers for scanning files",
+						Value: 8,
+					},
+					&cli.IntFlag{
+						Name:  "batch",
+						Usage: "Batch size for scanning files",
+						Value: 1000,
+					},
 				},
 				Action: scanFiles,
 			},
@@ -79,6 +90,16 @@ func main() {
 						Name:     "project",
 						Usage:    "Project name",
 						Required: true,
+					},
+					&cli.IntFlag{
+						Name:  "workers",
+						Usage: "Number of parallel workers for uploading files",
+						Value: 16,
+					},
+					&cli.IntFlag{
+						Name:  "batch",
+						Usage: "Batch size for uploading files",
+						Value: 100,
 					},
 				},
 				Action: startSync,
@@ -138,50 +159,67 @@ func createProject(c *cli.Context) error {
 
 func scanFiles(c *cli.Context) error {
 	projectName := c.String("project")
+	if projectName == "" {
+		return fmt.Errorf("project name is required")
+	}
 
 	db, err := db.New(projectName)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open database: %v", err)
 	}
 	defer db.Close()
 
 	project, err := db.GetProject(projectName)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get project: %v", err)
 	}
 
-	scanner := sync.NewScanner(db, project)
+	scannerConfig := sync.ScannerConfig{
+		NumWorkers: c.Int("workers"),
+		BatchSize:  c.Int("batch"),
+	}
+
+	scanner := sync.NewScanner(db, project, &scannerConfig)
 	if err := scanner.ScanFiles(); err != nil {
 		return fmt.Errorf("failed to scan files: %v", err)
 	}
 
-	fmt.Println("File scan completed successfully")
+	fmt.Println("Scan completed successfully")
 	return nil
 }
 
 func startSync(c *cli.Context) error {
 	projectName := c.String("project")
+	if projectName == "" {
+		return fmt.Errorf("project name is required")
+	}
 
 	db, err := db.New(projectName)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open database: %v", err)
 	}
 	defer db.Close()
 
 	project, err := db.GetProject(projectName)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get project: %v", err)
 	}
 
-	syncer, err := sync.NewSyncer(db, project)
+	syncerConfig := sync.SyncerConfig{
+		NumWorkers: c.Int("workers"),
+		BatchSize:  c.Int("batch"),
+	}
+
+	syncer, err := sync.NewSyncer(db, project, &syncerConfig)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create syncer: %v", err)
 	}
 
 	if err := syncer.SyncFiles(); err != nil {
 		return fmt.Errorf("failed to sync files: %v", err)
 	}
 
+	fmt.Println("Sync completed successfully")
 	return nil
 }
 
