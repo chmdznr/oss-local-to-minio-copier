@@ -37,3 +37,7 @@ Thumbs.db
 *.log
 
 *.exe
+*.db
+*.db-wal
+*.db-shm
+*.bak
