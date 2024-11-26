@@ -31,6 +31,18 @@ local-to-minio-copier/
 
 ## Installation
 
+### Using go install
+
+You can install msync using Go's package manager:
+
+```bash
+go install github.com/chmdznr/local-to-minio-copier/cmd/msync@latest
+```
+
+Make sure your Go bin directory (typically `$GOPATH/bin` or `$HOME/go/bin`) is in your system's PATH.
+
+### Manual Build
+
 Clone the repository and build manually:
 
 ```bash

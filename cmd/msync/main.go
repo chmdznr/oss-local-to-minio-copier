@@ -6,10 +6,10 @@ import (
 	"os"
 	"strings"
 
-	"local-to-minio-copier/internal/db"
-	"local-to-minio-copier/internal/sync"
-	"local-to-minio-copier/pkg/models"
-	"local-to-minio-copier/pkg/utils"
+	"github.com/chmdznr/local-to-minio-copier/internal/db"
+	"github.com/chmdznr/local-to-minio-copier/internal/sync"
+	"github.com/chmdznr/local-to-minio-copier/pkg/models"
+	"github.com/chmdznr/local-to-minio-copier/pkg/utils"
 
 	"github.com/urfave/cli/v2"
 )

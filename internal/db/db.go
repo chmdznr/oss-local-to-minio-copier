@@ -3,7 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
-	"local-to-minio-copier/pkg/models"
+	"github.com/chmdznr/local-to-minio-copier/pkg/models"
 
 	_ "github.com/mattn/go-sqlite3"
 )
