@@ -239,17 +239,63 @@ func NewSyncer(db *db.DB, project *models.Project, config *SyncerConfig) (*Synce
 	}, nil
 }
 
+type syncProgress struct {
+	TotalFiles    int64
+	TotalSize     int64
+	UploadedFiles int64
+	UploadedSize  int64
+	mu            sync.Mutex
+}
+
+func (p *syncProgress) Update(size int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.UploadedFiles++
+	p.UploadedSize += size
+}
+
+func (p *syncProgress) Print() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	percentage := float64(p.UploadedFiles) / float64(p.TotalFiles) * 100
+	fmt.Printf("\rUploaded %d/%d files (%.2f%%) - %.2f/%.2f GB...", 
+		p.UploadedFiles, p.TotalFiles,
+		percentage,
+		float64(p.UploadedSize)/(1024*1024*1024),
+		float64(p.TotalSize)/(1024*1024*1024))
+}
+
 // SyncFiles synchronizes pending files using a worker pool
 func (s *Syncer) SyncFiles() error {
 	// Create worker pool
 	type workItem struct {
 		filePath        string
 		destinationPath string
+		size            int64
 	}
 
 	jobs := make(chan workItem, s.numWorkers)
 	results := make(chan []string, s.numWorkers)
 	errors := make(chan error, 1)
+
+	// Initialize progress tracking
+	files, err := s.db.GetPendingFiles(s.project.Name)
+	if err != nil {
+		return err
+	}
+
+	progress := &syncProgress{
+		TotalFiles: int64(len(files)),
+	}
+	
+	// Calculate total size
+	for _, file := range files {
+		progress.TotalSize += file.Size
+	}
+
+	fmt.Printf("Starting sync of %d files (%.2f GB)...\n", 
+		progress.TotalFiles, 
+		float64(progress.TotalSize)/(1024*1024*1024))
 
 	// Start workers
 	var wg sync.WaitGroup
@@ -271,11 +317,13 @@ func (s *Syncer) SyncFiles() error {
 				)
 
 				if err != nil {
-					fmt.Printf("Failed to upload %s: %v\n", job.filePath, err)
+					fmt.Printf("\nFailed to upload %s: %v", job.filePath, err)
 					continue
 				}
 
 				completedFiles = append(completedFiles, job.filePath)
+				progress.Update(job.size)
+				progress.Print()
 
 				// Update status in batches
 				if len(completedFiles) >= s.batchSize {
@@ -300,18 +348,13 @@ func (s *Syncer) SyncFiles() error {
 		}
 	}()
 
-	// Get pending files and distribute work
-	files, err := s.db.GetPendingFiles(s.project.Name)
-	if err != nil {
-		return err
-	}
-
 	// Send jobs to workers
 	for _, file := range files {
 		destinationPath := strings.ReplaceAll(s.project.Destination.Folder+file.FilePath, "\\", "/")
 		jobs <- workItem{
 			filePath:        file.FilePath,
 			destinationPath: destinationPath,
+			size:           file.Size,
 		}
 	}
 
@@ -323,6 +366,9 @@ func (s *Syncer) SyncFiles() error {
 	case err := <-errors:
 		return err
 	default:
+		fmt.Printf("\nSync completed successfully: %d files (%.2f GB) uploaded\n",
+			progress.UploadedFiles,
+			float64(progress.UploadedSize)/(1024*1024*1024))
 		return nil
 	}
 }
