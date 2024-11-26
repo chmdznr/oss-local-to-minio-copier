@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
-	"local-to-minio-copier/internal/db"
-	"local-to-minio-copier/pkg/models"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"local-to-minio-copier/internal/db"
+	"local-to-minio-copier/pkg/models"
+	"local-to-minio-copier/pkg/utils"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -40,7 +42,7 @@ func (p *scanProgress) Update(size int64) {
 func (p *scanProgress) Print() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	fmt.Printf("\rScanned %d files (%.2f GB)...", p.CurrentFiles, float64(p.TotalSize)/1024/1024/1024)
+	fmt.Printf("\rScanned %d files (%s)...", p.CurrentFiles, utils.FormatSize(p.TotalSize))
 }
 
 // ScannerConfig holds configuration for the scanner
@@ -142,9 +144,9 @@ func (s *Scanner) ScanFiles() error {
 		return fmt.Errorf("scanning error: %v", err)
 	case <-done:
 		progress.Print()
-		fmt.Printf("\nScan completed: %d files (%.2f GB)\n",
+		fmt.Printf("\nScan completed: %d files (%s)\n",
 			progress.CurrentFiles,
-			float64(progress.TotalSize)/1024/1024/1024)
+			utils.FormatSize(progress.TotalSize))
 		return nil
 	}
 }
@@ -258,11 +260,11 @@ func (p *syncProgress) Print() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	percentage := float64(p.UploadedFiles) / float64(p.TotalFiles) * 100
-	fmt.Printf("\rUploaded %d/%d files (%.2f%%) - %.2f/%.2f GB...", 
+	fmt.Printf("\rUploaded %d/%d files (%.2f%%) - %s/%s...",
 		p.UploadedFiles, p.TotalFiles,
 		percentage,
-		float64(p.UploadedSize)/(1024*1024*1024),
-		float64(p.TotalSize)/(1024*1024*1024))
+		utils.FormatSize(p.UploadedSize),
+		utils.FormatSize(p.TotalSize))
 }
 
 // SyncFiles synchronizes pending files using a worker pool
@@ -287,15 +289,15 @@ func (s *Syncer) SyncFiles() error {
 	progress := &syncProgress{
 		TotalFiles: int64(len(files)),
 	}
-	
+
 	// Calculate total size
 	for _, file := range files {
 		progress.TotalSize += file.Size
 	}
 
-	fmt.Printf("Starting sync of %d files (%.2f GB)...\n", 
-		progress.TotalFiles, 
-		float64(progress.TotalSize)/(1024*1024*1024))
+	fmt.Printf("Starting sync of %d files (%s)...\n",
+		progress.TotalFiles,
+		utils.FormatSize(progress.TotalSize))
 
 	// Start workers
 	var wg sync.WaitGroup
@@ -354,7 +356,7 @@ func (s *Syncer) SyncFiles() error {
 		jobs <- workItem{
 			filePath:        file.FilePath,
 			destinationPath: destinationPath,
-			size:           file.Size,
+			size:            file.Size,
 		}
 	}
 
@@ -366,9 +368,9 @@ func (s *Syncer) SyncFiles() error {
 	case err := <-errors:
 		return err
 	default:
-		fmt.Printf("\nSync completed successfully: %d files (%.2f GB) uploaded\n",
+		fmt.Printf("\nSync completed successfully: %d files (%s) uploaded\n",
 			progress.UploadedFiles,
-			float64(progress.UploadedSize)/(1024*1024*1024))
+			utils.FormatSize(progress.UploadedSize))
 		return nil
 	}
 }

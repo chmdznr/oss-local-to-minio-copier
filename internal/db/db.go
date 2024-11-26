@@ -228,3 +228,30 @@ func (db *DB) GetFileStats(projectName string) (totalFiles, totalSize, uploadedF
 
 	return
 }
+
+// GetStats returns statistics about files in the project
+func (db *DB) GetStats(projectName string) (*models.Stats, error) {
+	var stats models.Stats
+	err := db.QueryRow(`
+		SELECT 
+			COUNT(*) as total_files,
+			COALESCE(SUM(size), 0) as total_size,
+			COUNT(CASE WHEN upload_status = 'uploaded' THEN 1 END) as uploaded_files,
+			COALESCE(SUM(CASE WHEN upload_status = 'uploaded' THEN size ELSE 0 END), 0) as uploaded_size,
+			COUNT(CASE WHEN upload_status = 'pending' THEN 1 END) as pending_files,
+			COALESCE(SUM(CASE WHEN upload_status = 'pending' THEN size ELSE 0 END), 0) as pending_size
+		FROM files 
+		WHERE project_name = ?
+	`, projectName).Scan(
+		&stats.TotalFiles,
+		&stats.TotalSize,
+		&stats.UploadedFiles,
+		&stats.UploadedSize,
+		&stats.PendingFiles,
+		&stats.PendingSize,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stats: %v", err)
+	}
+	return &stats, nil
+}

@@ -9,6 +9,7 @@ import (
 	"local-to-minio-copier/internal/db"
 	"local-to-minio-copier/internal/sync"
 	"local-to-minio-copier/pkg/models"
+	"local-to-minio-copier/pkg/utils"
 
 	"github.com/urfave/cli/v2"
 )
@@ -223,57 +224,37 @@ func startSync(c *cli.Context) error {
 	return nil
 }
 
-func formatSize(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
-}
-
 func showStatus(c *cli.Context) error {
 	projectName := c.String("project")
+	if projectName == "" {
+		return fmt.Errorf("project name is required")
+	}
 
 	db, err := db.New(projectName)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open database: %v", err)
 	}
 	defer db.Close()
 
 	project, err := db.GetProject(projectName)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get project: %v", err)
 	}
 
-	totalFiles, totalSize, uploadedFiles, uploadedSize, err := db.GetFileStats(projectName)
+	stats, err := db.GetStats(projectName)
 	if err != nil {
-		return err
-	}
-
-	pendingFiles := totalFiles - uploadedFiles
-	pendingSize := totalSize - uploadedSize
-
-	fileProgress := 0.0
-	if totalFiles > 0 {
-		fileProgress = float64(uploadedFiles) / float64(totalFiles) * 100
-	}
-
-	sizeProgress := 0.0
-	if totalSize > 0 {
-		sizeProgress = float64(uploadedSize) / float64(totalSize) * 100
+		return fmt.Errorf("failed to get stats: %v", err)
 	}
 
 	fmt.Printf("Project: %s\n", project.Name)
 	fmt.Printf("Source Path: %s\n", project.SourcePath)
-	fmt.Printf("Destination: %s/%s/%s\n", project.Destination.Endpoint, project.Destination.Bucket, project.Destination.Folder)
-	fmt.Printf("Total Files: %d (Size: %s)\n", totalFiles, formatSize(totalSize))
-	fmt.Printf("Files Uploaded: %d (Size: %s)\n", uploadedFiles, formatSize(uploadedSize))
-	fmt.Printf("Files Pending: %d (Size: %s)\n", pendingFiles, formatSize(pendingSize))
+	fmt.Printf("Destination: %s/%s/\n", project.Destination.Endpoint, project.Destination.Bucket)
+	fmt.Printf("Total Files: %d (Size: %s)\n", stats.TotalFiles, utils.FormatSize(stats.TotalSize))
+	fmt.Printf("Files Uploaded: %d (Size: %s)\n", stats.UploadedFiles, utils.FormatSize(stats.UploadedSize))
+	fmt.Printf("Files Pending: %d (Size: %s)\n", stats.PendingFiles, utils.FormatSize(stats.PendingSize))
+
+	fileProgress := float64(stats.UploadedFiles) / float64(stats.TotalFiles) * 100
+	sizeProgress := float64(stats.UploadedSize) / float64(stats.TotalSize) * 100
 	fmt.Printf("Progress: %.2f%% (Files), %.2f%% (Size)\n", fileProgress, sizeProgress)
 
 	return nil
