@@ -300,7 +300,20 @@ type syncProgress struct {
 	SkippedSize   int64
 	RetryFiles    int64
 	RetrySize     int64
+	startTime     time.Time
+	lastUpdate    time.Time
+	lastSize      int64
 	sync.Mutex
+}
+
+func newSyncProgress(totalFiles int64, totalSize int64) *syncProgress {
+	now := time.Now()
+	return &syncProgress{
+		TotalFiles: totalFiles,
+		TotalSize:  totalSize,
+		startTime:  now,
+		lastUpdate: now,
+	}
 }
 
 func (p *syncProgress) Update(size int64, isRetry bool) {
@@ -321,14 +334,53 @@ func (p *syncProgress) Skip(size int64) {
 	p.SkippedSize += size
 }
 
+func (p *syncProgress) getSpeed() (avgSpeed float64, currentSpeed float64) {
+	now := time.Now()
+	totalDuration := now.Sub(p.startTime).Seconds()
+	if totalDuration > 0 {
+		avgSpeed = float64(p.UploadedSize) / totalDuration
+	}
+
+	// Calculate current speed over the last update interval
+	intervalDuration := now.Sub(p.lastUpdate).Seconds()
+	sizeDiff := float64(p.UploadedSize - p.lastSize)
+	if intervalDuration > 0 {
+		currentSpeed = sizeDiff / intervalDuration
+	}
+
+	// Update last values for next calculation
+	p.lastUpdate = now
+	p.lastSize = p.UploadedSize
+
+	return avgSpeed, currentSpeed
+}
+
+func formatSpeed(bytesPerSecond float64) string {
+	if bytesPerSecond < 1024 {
+		return fmt.Sprintf("%.1f B/s", bytesPerSecond)
+	} else if bytesPerSecond < 1024*1024 {
+		return fmt.Sprintf("%.1f KB/s", bytesPerSecond/1024)
+	} else if bytesPerSecond < 1024*1024*1024 {
+		return fmt.Sprintf("%.1f MB/s", bytesPerSecond/1024/1024)
+	}
+	return fmt.Sprintf("%.1f GB/s", bytesPerSecond/1024/1024/1024)
+}
+
 func (p *syncProgress) Print() {
 	p.Lock()
 	defer p.Unlock()
-	fmt.Printf("\rProgress: %d/%d files (%s/%s) - Retried: %d (%s) - Skipped: %d (%s)",
+
+	avgSpeed, currentSpeed := p.getSpeed()
+	percentage := float64(p.UploadedSize) / float64(p.TotalSize) * 100
+
+	fmt.Printf("\rProgress: %d/%d files (%.1f%%) - %s/%s | Speed: %s (avg: %s) | Retried: %d (%s) - Skipped: %d (%s)",
 		p.UploadedFiles,
 		p.TotalFiles,
+		percentage,
 		utils.FormatSize(p.UploadedSize),
 		utils.FormatSize(p.TotalSize),
+		formatSpeed(currentSpeed),
+		formatSpeed(avgSpeed),
 		p.RetryFiles,
 		utils.FormatSize(p.RetrySize),
 		p.SkippedFiles,
@@ -356,18 +408,16 @@ func (s *Syncer) SyncFiles() error {
 		return err
 	}
 
-	progress := &syncProgress{
-		TotalFiles: int64(len(files)),
-	}
-
-	// Calculate total size and count retries
+	var totalSize int64
 	retriesCount := 0
 	for _, file := range files {
-		progress.TotalSize += file.Size
+		totalSize += file.Size
 		if file.UploadStatus == "failed" {
 			retriesCount++
 		}
 	}
+
+	progress := newSyncProgress(int64(len(files)), totalSize)
 
 	fmt.Printf("Starting sync of %d files (%s) - %d files being retried...\n",
 		progress.TotalFiles,
@@ -461,8 +511,12 @@ func (s *Syncer) SyncFiles() error {
 	case err := <-errors:
 		return err
 	default:
-		fmt.Printf("\nSync completed:\n")
-		fmt.Printf("- Uploaded: %d files (%s)\n", progress.UploadedFiles, utils.FormatSize(progress.UploadedSize))
+		avgSpeed, _ := progress.getSpeed()
+		fmt.Printf("\nSync completed in %s:\n", time.Since(progress.startTime).Round(time.Second))
+		fmt.Printf("- Uploaded: %d files (%s) at %s average\n",
+			progress.UploadedFiles,
+			utils.FormatSize(progress.UploadedSize),
+			formatSpeed(avgSpeed))
 		fmt.Printf("- Retried: %d files (%s)\n", progress.RetryFiles, utils.FormatSize(progress.RetrySize))
 		fmt.Printf("- Skipped: %d files (%s)\n", progress.SkippedFiles, utils.FormatSize(progress.SkippedSize))
 		return nil
