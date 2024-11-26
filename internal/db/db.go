@@ -135,3 +135,28 @@ func (db *DB) SaveFileRecord(projectName string, record *models.FileRecord) erro
 	`, projectName, record.FilePath, record.Size, record.Timestamp, record.UploadStatus)
 	return err
 }
+
+// GetFileStats returns statistics about files in the project
+func (db *DB) GetFileStats(projectName string) (totalFiles, totalSize, uploadedFiles, uploadedSize int64, err error) {
+	// Get total files and size
+	err = db.QueryRow(`
+		SELECT COUNT(*), COALESCE(SUM(size), 0)
+		FROM files
+		WHERE project_name = ?
+	`, projectName).Scan(&totalFiles, &totalSize)
+	if err != nil {
+		return
+	}
+
+	// Get uploaded files and size
+	err = db.QueryRow(`
+		SELECT COUNT(*), COALESCE(SUM(size), 0)
+		FROM files
+		WHERE project_name = ? AND upload_status = 'uploaded'
+	`, projectName).Scan(&uploadedFiles, &uploadedSize)
+	if err != nil {
+		return
+	}
+
+	return
+}

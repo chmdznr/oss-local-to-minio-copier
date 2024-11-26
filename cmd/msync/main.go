@@ -83,6 +83,18 @@ func main() {
 				},
 				Action: startSync,
 			},
+			{
+				Name:  "status",
+				Usage: "Show project status",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:     "project",
+						Usage:    "Project name",
+						Required: true,
+					},
+				},
+				Action: showStatus,
+			},
 		},
 	}
 
@@ -169,6 +181,62 @@ func startSync(c *cli.Context) error {
 	if err := syncer.SyncFiles(); err != nil {
 		return fmt.Errorf("failed to sync files: %v", err)
 	}
+
+	return nil
+}
+
+func formatSize(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+func showStatus(c *cli.Context) error {
+	projectName := c.String("project")
+
+	db, err := db.New(projectName)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	project, err := db.GetProject(projectName)
+	if err != nil {
+		return err
+	}
+
+	totalFiles, totalSize, uploadedFiles, uploadedSize, err := db.GetFileStats(projectName)
+	if err != nil {
+		return err
+	}
+
+	pendingFiles := totalFiles - uploadedFiles
+	pendingSize := totalSize - uploadedSize
+
+	fileProgress := 0.0
+	if totalFiles > 0 {
+		fileProgress = float64(uploadedFiles) / float64(totalFiles) * 100
+	}
+
+	sizeProgress := 0.0
+	if totalSize > 0 {
+		sizeProgress = float64(uploadedSize) / float64(totalSize) * 100
+	}
+
+	fmt.Printf("Project: %s\n", project.Name)
+	fmt.Printf("Source Path: %s\n", project.SourcePath)
+	fmt.Printf("Destination: %s/%s/%s\n", project.Destination.Endpoint, project.Destination.Bucket, project.Destination.Folder)
+	fmt.Printf("Total Files: %d (Size: %s)\n", totalFiles, formatSize(totalSize))
+	fmt.Printf("Files Uploaded: %d (Size: %s)\n", uploadedFiles, formatSize(uploadedSize))
+	fmt.Printf("Files Pending: %d (Size: %s)\n", pendingFiles, formatSize(pendingSize))
+	fmt.Printf("Progress: %.2f%% (Files), %.2f%% (Size)\n", fileProgress, sizeProgress)
 
 	return nil
 }
