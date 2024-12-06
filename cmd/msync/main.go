@@ -130,11 +130,6 @@ func main() {
 						Usage:    "Path to CSV file",
 						Required: true,
 					},
-					&cli.StringFlag{
-						Name:     "source",
-						Usage:    "Source directory path",
-						Required: true,
-					},
 					&cli.IntFlag{
 						Name:  "batch",
 						Usage: "Batch size for processing",
@@ -297,7 +292,6 @@ func showStatus(c *cli.Context) error {
 func importCSV(c *cli.Context) error {
 	projectName := c.String("project")
 	csvPath := c.String("csv")
-	sourcePath := c.String("source")
 	batchSize := c.Int("batch")
 
 	if projectName == "" {
@@ -305,9 +299,6 @@ func importCSV(c *cli.Context) error {
 	}
 	if csvPath == "" {
 		return fmt.Errorf("CSV file path is required")
-	}
-	if sourcePath == "" {
-		return fmt.Errorf("source directory path is required")
 	}
 	if batchSize <= 0 {
 		batchSize = 1000 // default batch size
@@ -320,10 +311,16 @@ func importCSV(c *cli.Context) error {
 	}
 	defer db.Close()
 
+	// Get project details to get source path
+	project, err := db.GetProject(projectName)
+	if err != nil {
+		return fmt.Errorf("failed to get project details: %v", err)
+	}
+
 	// Open CSV file
 	file, err := os.Open(csvPath)
 	if err != nil {
-		return fmt.Errorf("error opening CSV file: %v", err)
+		return fmt.Errorf("failed to open CSV file: %v", err)
 	}
 	defer file.Close()
 
@@ -332,70 +329,125 @@ func importCSV(c *cli.Context) error {
 	reader.FieldsPerRecord = -1 // Allow variable number of fields
 
 	// Skip header row
-	_, err = reader.Read()
+	header, err := reader.Read()
 	if err != nil {
-		return fmt.Errorf("error reading CSV header: %v", err)
+		return fmt.Errorf("failed to read CSV header: %v", err)
 	}
 
-	// Initialize counters
-	processed := 0
-	missing := 0
-	batch := make([][]string, 0, batchSize)
+	// Map header indices
+	headerMap := make(map[string]int)
+	for i, h := range header {
+		headerMap[strings.TrimSpace(strings.ToLower(h))] = i
+	}
 
-	// Process each row
-	for lineNum := 2; ; lineNum++ { // Start from 2 to account for header row
-		record, err := reader.Read()
+	// Required fields
+	requiredFields := []string{
+		"id_upload", "path", "nama_modul", "file_type",
+		"nama_file_asli", "id_profile", "id", "str_key", "str_subkey",
+	}
+
+	// Verify required fields
+	for _, field := range requiredFields {
+		if _, ok := headerMap[field]; !ok {
+			return fmt.Errorf("required field '%s' not found in CSV", field)
+		}
+	}
+
+	// Process records in batches
+	var records []models.CSVRecord
+	recordCount := 0
+	skippedCount := 0
+	var totalSize int64
+
+	// Get existing files to track updates
+	existingFiles, err := db.GetProjectFiles(projectName)
+	if err != nil {
+		return fmt.Errorf("failed to get existing files: %v", err)
+	}
+	existingFilesMap := make(map[string]bool)
+	for _, f := range existingFiles {
+		existingFilesMap[f.FilePath] = true
+	}
+	updatedCount := 0
+
+	fmt.Println("Starting import process...")
+	fmt.Println("Checking files and collecting sizes...")
+
+	for {
+		row, err := reader.Read()
 		if err == io.EOF {
-			// Process remaining batch
-			if len(batch) > 0 {
-				if err := processBatch(db, projectName, sourcePath, batch, &processed, &missing); err != nil {
-					return err
+			if len(records) > 0 {
+				if err := db.SaveFileRecordsFromCSVBatch(projectName, records); err != nil {
+					return fmt.Errorf("failed to save batch: %v", err)
 				}
 			}
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("error reading CSV line %d: %v", lineNum, err)
+			return fmt.Errorf("failed to read CSV row: %v", err)
 		}
 
-		if len(record) < 4 {
-			return fmt.Errorf("invalid CSV format at line %d: expected at least 4 columns", lineNum)
-		}
+		filePath := row[headerMap["path"]]
+		fullPath := filepath.Join(project.SourcePath, filePath)
 
-		batch = append(batch, record)
-		if len(batch) >= batchSize {
-			if err := processBatch(db, projectName, sourcePath, batch, &processed, &missing); err != nil {
-				return err
+		// Check if file exists and get its info
+		fileInfo, err := os.Stat(fullPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				skippedCount++
+				if err := db.AddMissingFile(fullPath, recordCount+2); err != nil {
+					log.Printf("Error recording missing file: %v", err)
+				}
+				continue
 			}
-			batch = batch[:0] // Clear batch
+			return fmt.Errorf("failed to get file info for %s: %v", filePath, err)
 		}
-	}
 
-	fmt.Printf("\nImport Summary:\n")
-	fmt.Printf("- Successfully processed: %d files\n", processed)
-	fmt.Printf("- Missing files: %d\n", missing)
-
-	return nil
-}
-
-func processBatch(db *db.DB, projectName, sourcePath string, batch [][]string, processed, missing *int) error {
-	for _, record := range batch {
-		filePath := filepath.Join(sourcePath, record[3])
-		
-		// Check if file exists
-		if _, err := os.Stat(filePath); os.IsNotExist(err) {
-			if err := db.AddMissingFile(filePath, 0); err != nil {
-				log.Printf("Error recording missing file: %v", err)
-			}
-			*missing++
+		// Skip directories
+		if fileInfo.IsDir() {
+			skippedCount++
 			continue
 		}
 
-		// Add file to database
-		if err := db.AddFileFromCSV(projectName, record[0], record[1], record[2], filePath); err != nil {
-			return fmt.Errorf("error adding file: %v", err)
+		record := models.CSVRecord{
+			IDUpload:     row[headerMap["id_upload"]],
+			Path:         filePath,
+			NamaModul:    row[headerMap["nama_modul"]],
+			FileType:     row[headerMap["file_type"]],
+			NamaFileAsli: row[headerMap["nama_file_asli"]],
+			IDProfile:    row[headerMap["id_profile"]],
+			ID:           row[headerMap["id"]],
+			StrKey:       row[headerMap["str_key"]],
+			StrSubKey:    row[headerMap["str_subkey"]],
+			Size:         fileInfo.Size(),
 		}
-		*processed++
+
+		records = append(records, record)
+		if existingFilesMap[filePath] {
+			updatedCount++
+		} else {
+			recordCount++
+		}
+		totalSize += fileInfo.Size()
+
+		if len(records) >= batchSize {
+			if err := db.SaveFileRecordsFromCSVBatch(projectName, records); err != nil {
+				return fmt.Errorf("failed to save batch: %v", err)
+			}
+			records = records[:0]
+			fmt.Printf("\rProcessed %d new files, updated %d files (%s), skipped %d files", 
+				recordCount,
+				updatedCount,
+				utils.FormatSize(totalSize),
+				skippedCount,
+			)
+		}
 	}
+
+	fmt.Printf("\nImport completed:\n")
+	fmt.Printf("- New files imported: %d\n", recordCount)
+	fmt.Printf("- Existing files updated: %d\n", updatedCount)
+	fmt.Printf("- Total size: %s\n", utils.FormatSize(totalSize))
+	fmt.Printf("- Skipped: %d files\n", skippedCount)
 	return nil
 }
