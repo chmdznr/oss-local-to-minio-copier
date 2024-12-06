@@ -35,7 +35,6 @@ func New(projectName string) (*DB, error) {
 // initialize creates the necessary tables if they don't exist
 func (db *DB) initialize() error {
 	_, err := db.Exec(`
-		DROP TABLE IF EXISTS files;
 		CREATE TABLE IF NOT EXISTS projects (
 			name TEXT PRIMARY KEY,
 			source_path TEXT NOT NULL,
@@ -66,7 +65,6 @@ func (db *DB) initialize() error {
 			UNIQUE(project_name, filepath)
 		);
 
-		DROP TABLE IF EXISTS missing_files;
 		CREATE TABLE IF NOT EXISTS missing_files (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			filepath TEXT NOT NULL,
