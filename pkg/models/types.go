@@ -1,7 +1,6 @@
 package models
 
 import (
-	"encoding/json"
 	"time"
 )
 
@@ -30,37 +29,37 @@ type CSVRecord struct {
 
 // FileRecord represents a file record in the database
 type FileRecord struct {
-	FilePath     string    `json:"file_path"`
-	IDFile       string    `json:"id_file"`
-	IDPermohonan string    `json:"id_permohonan"`
-	IDFromCSV    string    `json:"id_from_csv"`
-	Size         int64     `json:"size"`
-	FileType     string    `json:"file_type"`
-	BucketPath   string    `json:"bucketpath"`
-	Metadata     string    `json:"f_metadata"`
-	UserID       string    `json:"userid"`
-	CreatedAt    time.Time `json:"created_at"`
-	StrKey       string    `json:"str_key"`
-	StrSubKey    string    `json:"str_subkey"`
-	Timestamp    time.Time `json:"timestamp"`
-	UploadStatus string    `json:"upload_status"`
+	FilePath     string            `json:"file_path"`
+	IDFile       string            `json:"id_file"`
+	IDPermohonan string            `json:"id_permohonan"`
+	IDFromCSV    string            `json:"id_from_csv"`
+	Size         int64             `json:"size"`
+	FileType     string            `json:"file_type"`
+	BucketPath   string            `json:"bucketpath"`
+	Metadata     map[string]string `json:"f_metadata"`
+	UserID       string            `json:"userid"`
+	CreatedAt    time.Time         `json:"created_at"`
+	StrKey       string            `json:"str_key"`
+	StrSubKey    string            `json:"str_subkey"`
+	Timestamp    time.Time         `json:"timestamp"`
+	UploadStatus string            `json:"upload_status"`
 }
 
-func (f *FileRecord) SetMetadata(metadata FileMetadata) error {
-	jsonData, err := json.Marshal(metadata)
-	if err != nil {
-		return err
+func (f *FileRecord) SetMetadata(metadata map[string]string) error {
+	if f.Metadata == nil {
+		f.Metadata = make(map[string]string)
 	}
-	f.Metadata = string(jsonData)
+	for k, v := range metadata {
+		f.Metadata[k] = v
+	}
 	return nil
 }
 
-func (f *FileRecord) GetMetadata() (*FileMetadata, error) {
-	var metadata FileMetadata
-	if err := json.Unmarshal([]byte(f.Metadata), &metadata); err != nil {
-		return nil, err
+func (f *FileRecord) GetMetadata() (map[string]string, error) {
+	if f.Metadata == nil {
+		return make(map[string]string), nil
 	}
-	return &metadata, nil
+	return f.Metadata, nil
 }
 
 type Project struct {

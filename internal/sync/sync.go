@@ -3,11 +3,8 @@ package sync
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"encoding/json"
 
 	"github.com/chmdznr/oss-local-to-minio-copier/internal/db"
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/models"
@@ -81,9 +80,6 @@ func NewSyncer(db *db.DB, project *models.Project, config *SyncerConfig) (*Synce
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize MinIO client: %v", err)
 	}
-
-	// Enable request/response debugging if needed
-	minioClient.TraceOn(os.Stdout)
 
 	return &Syncer{
 		db:          db,
@@ -191,129 +187,56 @@ func (p *syncProgress) Print() {
 	)
 }
 
-func (s *Syncer) uploadFile(ctx context.Context, file *models.File) error {
-	// Sanitize the destination path
-	destPath := sanitizePath(file.DestPath)
-	
-	// Open the file
-	fileReader, err := os.Open(file.LocalPath)
-	if err != nil {
-		return fmt.Errorf("failed to open file %s: %v", file.LocalPath, err)
-	}
-	defer fileReader.Close()
-
-	// Get file info for content type detection
-	fileInfo, err := fileReader.Stat()
-	if err != nil {
-		return fmt.Errorf("failed to get file info for %s: %v", file.LocalPath, err)
+func (s *Syncer) uploadFile(file models.FileRecord) error {
+	// Use the metadata map directly since it's already parsed in GetPendingFiles
+	userMetadata := file.Metadata
+	if userMetadata == nil {
+		userMetadata = make(map[string]string)
 	}
 
-	// Detect content type
-	contentType := mime.TypeByExtension(filepath.Ext(file.LocalPath))
-	if contentType == "" {
-		// If no extension match, try to detect from content
-		buffer := make([]byte, 512)
-		_, err = fileReader.Read(buffer)
-		if err != nil && err != io.EOF {
-			return fmt.Errorf("failed to read file content for type detection: %v", err)
-		}
-		contentType = http.DetectContentType(buffer)
-		// Reset the reader to the beginning
-		_, err = fileReader.Seek(0, 0)
-		if err != nil {
-			return fmt.Errorf("failed to reset file reader: %v", err)
-		}
-	}
-
-	// Sanitize metadata - encode both keys and values
-	sanitizedMetadata := make(map[string]string)
-	for k, v := range file.Metadata {
-		// URL encode both keys and values to handle special characters
-		encodedKey := url.QueryEscape(strings.TrimSpace(k))
-		encodedValue := url.QueryEscape(strings.TrimSpace(v))
-		if encodedValue != "" {
-			// For x-amz-meta-path, we need to encode each path segment
-			if strings.ToLower(k) == "path" {
-				pathSegments := strings.Split(v, "/")
-				for i, segment := range pathSegments {
-					pathSegments[i] = url.PathEscape(segment)
+	// Ensure required metadata fields exist
+	requiredFields := []string{"id_file", "id_from_csv", "id_permohonan"}
+	for _, field := range requiredFields {
+		if _, exists := userMetadata[field]; !exists {
+			// Add from FileRecord struct if available
+			switch field {
+			case "id_file":
+				if file.IDFile != "" {
+					userMetadata[field] = file.IDFile
 				}
-				encodedValue = strings.Join(pathSegments, "/")
+			case "id_from_csv":
+				if file.IDFromCSV != "" {
+					userMetadata[field] = file.IDFromCSV
+				}
+			case "id_permohonan":
+				if file.IDPermohonan != "" {
+					userMetadata[field] = file.IDPermohonan
+				}
 			}
-			sanitizedMetadata[encodedKey] = encodedValue
 		}
 	}
 
-	// Add content disposition to force download with original filename
-	// Use RFC 5987 encoding for the filename
-	originalFilename := filepath.Base(file.LocalPath)
-	contentDisposition := fmt.Sprintf("attachment; filename=\"%s\"; filename*=UTF-8''%s", 
-		strings.ReplaceAll(originalFilename, "\"", "\\\""),
-		url.PathEscape(originalFilename))
-
-	// Prepare upload options with proper headers
-	opts := minio.PutObjectOptions{
-		ContentType:        contentType,
-		ContentDisposition: contentDisposition,
-		UserMetadata:      sanitizedMetadata,
+	// Open the file
+	localFile, err := os.Open(file.FilePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file %s: %v", file.FilePath, err)
 	}
+	defer localFile.Close()
 
-	// Attempt the upload with retry logic
-	maxRetries := 3
-	var uploadErr error
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		info, uploadErr := s.minioClient.PutObject(
-			ctx,
-			s.project.Destination.Bucket,
-			destPath,
-			fileReader,
-			fileInfo.Size(),
-			opts,
-		)
+	// Upload the file with metadata
+	_, err = s.minioClient.PutObject(
+		context.Background(),
+		s.project.Destination.Bucket,
+		file.IDFile,
+		localFile,
+		file.Size,
+		minio.PutObjectOptions{
+			UserMetadata: userMetadata,
+		},
+	)
 
-		if uploadErr == nil {
-			// Update file status on successful upload
-			if info.Size > 0 {
-				return nil
-			}
-		}
-
-		// Log detailed error information
-		log.Printf("Upload attempt %d failed for file %s: %v", attempt, file.LocalPath, uploadErr)
-
-		// Check if error is retriable
-		if minioErr, ok := uploadErr.(minio.ErrorResponse); ok {
-			log.Printf("MinIO Error Details - Code: %s, Message: %s, RequestID: %s", 
-				minioErr.Code, minioErr.Message, minioErr.RequestID)
-			
-			// Handle specific error cases
-			switch minioErr.Code {
-			case "AccessDenied":
-				return fmt.Errorf("access denied to bucket %s: %v", s.project.Destination.Bucket, uploadErr)
-			case "NoSuchBucket":
-				return fmt.Errorf("bucket %s does not exist: %v", s.project.Destination.Bucket, uploadErr)
-			case "InvalidAccessKeyId":
-				return fmt.Errorf("invalid access key: %v", uploadErr)
-			case "SignatureDoesNotMatch":
-				// Log additional details for signature mismatch
-				log.Printf("Signature mismatch details - Region: %s, Endpoint: %s", 
-					minioErr.Region, s.project.Destination.Endpoint)
-			}
-		}
-
-		// Reset file pointer for retry
-		if attempt < maxRetries {
-			_, err = fileReader.Seek(0, 0)
-			if err != nil {
-				return fmt.Errorf("failed to reset file for retry: %v", err)
-			}
-			// Wait before retrying with exponential backoff
-			time.Sleep(time.Duration(attempt*attempt) * time.Second)
-		}
-	}
-
-	if uploadErr != nil {
-		return fmt.Errorf("failed to upload file %s after %d attempts: %v", file.LocalPath, maxRetries, uploadErr)
+	if err != nil {
+		return fmt.Errorf("failed to upload file %s: %v", file.FilePath, err)
 	}
 
 	return nil
@@ -371,7 +294,7 @@ func (s *Syncer) SyncFiles() error {
 					log.Printf("\nSkipping %s: file no longer exists\n", job.filePath)
 					progress.Skip(job.size)
 					progress.Print()
-					
+
 					// Mark as skipped in database
 					if err := s.db.UpdateFileStatus(s.project.Name, job.filePath, "skipped"); err != nil {
 						log.Printf("\nFailed to update status for %s: %v\n", job.filePath, err)
@@ -389,6 +312,9 @@ func (s *Syncer) SyncFiles() error {
 						if k == "path" {
 							// Special handling for path metadata
 							sanitized = sanitizePath(v)
+						} else if k == "bucket" {
+							// Special handling for bucket metadata - don't URL encode
+							sanitized = v
 						} else {
 							// For other metadata values, first decode if already encoded
 							decoded, err := url.QueryUnescape(v)
@@ -433,7 +359,7 @@ func (s *Syncer) SyncFiles() error {
 					log.Printf("  Local path: %s\n", fullPath)
 					log.Printf("  Destination: %s/%s\n", s.project.Destination.Bucket, job.destinationPath)
 					log.Printf("  Error: %v\n", err)
-					
+
 					// Check if it's a MinIO error
 					if minioErr, ok := err.(minio.ErrorResponse); ok {
 						log.Printf("  MinIO Error Details:\n")
@@ -442,7 +368,7 @@ func (s *Syncer) SyncFiles() error {
 						log.Printf("    Key: %s\n", minioErr.Key)
 						log.Printf("    BucketName: %s\n", minioErr.BucketName)
 					}
-					
+
 					// Mark as failed in database
 					if dbErr := s.db.UpdateFileStatus(s.project.Name, job.filePath, "failed"); dbErr != nil {
 						log.Printf("Failed to update status for %s: %v\n", job.filePath, dbErr)
@@ -495,24 +421,15 @@ func (s *Syncer) SyncFiles() error {
 		destinationPath := fmt.Sprintf("%s%s", folder, file.IDFile)
 
 		// Create complete metadata
-		metadata := map[string]string{
-			"path":          file.FilePath,
-			"nama_modul":    "",  // Will be populated from CSV metadata
-			"nama_file_asli": "", // Will be populated from CSV metadata
-			"id_profile":    "",  // Will be populated from CSV metadata
-			"bucket":        fmt.Sprintf("%s/%s", s.project.Destination.Bucket, destinationPath),
-			"existing_id":   file.IDFromCSV,
+		metadata := file.Metadata
+		if metadata == nil {
+			metadata = make(map[string]string)
 		}
 
-		// Parse existing metadata if available
-		if file.Metadata != "" {
-			var existingMeta map[string]string
-			if err := json.Unmarshal([]byte(file.Metadata), &existingMeta); err == nil {
-				metadata["nama_modul"] = existingMeta["nama_modul"]
-				metadata["nama_file_asli"] = existingMeta["nama_file_asli"]
-				metadata["id_profile"] = existingMeta["id_profile"]
-			}
-		}
+		// Preserve existing metadata values and set bucket without URL encoding
+		metadata["path"] = sanitizePath(file.FilePath)
+		metadata["bucket"] = fmt.Sprintf("%s/%s", s.project.Destination.Bucket, strings.TrimPrefix(destinationPath, "/"))
+		metadata["existing_id"] = file.IDFromCSV
 
 		// Sanitize destination path - replace problematic characters
 		destinationPath = strings.Map(func(r rune) rune {
@@ -533,9 +450,9 @@ func (s *Syncer) SyncFiles() error {
 		jobs <- workItem{
 			filePath:        file.FilePath,
 			destinationPath: destinationPath,
-			size:           file.Size,
-			isRetry:        file.UploadStatus == "failed",
-			metadata:       metadata,
+			size:            file.Size,
+			isRetry:         file.UploadStatus == "failed",
+			metadata:        metadata,
 		}
 	}
 

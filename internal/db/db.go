@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/models"
@@ -133,10 +134,12 @@ func (db *DB) GetPendingFiles(projectName string) ([]models.FileRecord, error) {
 		SELECT 
 			filepath,
 			COALESCE(id_file, '') as id_file,
+			COALESCE(id_from_csv, '') as id_from_csv,
 			COALESCE(id_permohonan, '') as id_permohonan,
 			COALESCE(timestamp, '') as timestamp,
 			COALESCE(status, '') as status,
-			COALESCE(file_size, 0) as file_size
+			COALESCE(file_size, 0) as file_size,
+			COALESCE(f_metadata, '') as f_metadata
 		FROM files
 		WHERE project_name = ? AND (status = 'pending' OR status = 'failed')
 	`, projectName)
@@ -149,13 +152,16 @@ func (db *DB) GetPendingFiles(projectName string) ([]models.FileRecord, error) {
 	for rows.Next() {
 		var file models.FileRecord
 		var timestamp string
+		var metadataStr string
 		err := rows.Scan(
 			&file.FilePath,
 			&file.IDFile,
+			&file.IDFromCSV,
 			&file.IDPermohonan,
 			&timestamp,
 			&file.UploadStatus,
 			&file.Size,
+			&metadataStr,
 		)
 		if err != nil {
 			return nil, err
@@ -163,6 +169,24 @@ func (db *DB) GetPendingFiles(projectName string) ([]models.FileRecord, error) {
 
 		// Parse timestamps
 		file.Timestamp, _ = time.Parse("2006-01-02 15:04:05", timestamp)
+
+		// Initialize empty metadata map
+		file.Metadata = make(map[string]string)
+
+		// Parse metadata if present
+		if metadataStr != "" {
+			var metadata map[string]interface{}
+			if err := json.Unmarshal([]byte(metadataStr), &metadata); err != nil {
+				log.Printf("Warning: Failed to parse metadata for file %s: %v", file.FilePath, err)
+			} else {
+				// Convert all values to strings
+				for k, v := range metadata {
+					if v != nil {
+						file.Metadata[k] = fmt.Sprintf("%v", v)
+					}
+				}
+			}
+		}
 
 		files = append(files, file)
 	}
@@ -330,12 +354,11 @@ func (db *DB) GetFileByPath(projectName string, filePath string) (*models.FileRe
 
 // SaveFileRecordFromCSV saves a file record from CSV data
 func (db *DB) SaveFileRecordFromCSV(projectName string, csvRecord *models.CSVRecord) error {
-	metadata := models.FileMetadata{
-		Path:         csvRecord.Path,
-		NamaModul:    csvRecord.NamaModul,
-		NamaFileAsli: csvRecord.NamaFileAsli,
-		IDProfile:    csvRecord.IDProfile,
-		ExistingID:   csvRecord.ID,
+	metadata := map[string]string{
+		"nama_modul":     csvRecord.NamaModul,
+		"nama_file_asli": csvRecord.NamaFileAsli,
+		"id_profile":     csvRecord.IDProfile,
+		"existing_id":    csvRecord.ID,
 	}
 
 	metadataJSON, err := json.Marshal(metadata)
@@ -414,32 +437,34 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 
 	now := time.Now()
 	for _, record := range records {
-		metadataJSON, err := json.Marshal(map[string]interface{}{
-			"id_upload":      record.IDUpload,
+		metadata := map[string]string{
 			"nama_modul":     record.NamaModul,
 			"nama_file_asli": record.NamaFileAsli,
 			"id_profile":     record.IDProfile,
-		})
+			"existing_id":    record.ID,
+		}
+
+		metadataJSON, err := json.Marshal(metadata)
 		if err != nil {
 			return fmt.Errorf("failed to marshal metadata: %v", err)
 		}
 
 		_, err = stmt.Exec(
 			projectName,
-			record.IDUpload,    // id_file
-			record.ID,          // id_permohonan
-			record.ID,          // id_from_csv
-			record.Path,        // filepath
-			record.Size,        // file_size
-			record.FileType,    // file_type
-			"",                 // bucketpath (to be set during upload)
+			record.IDUpload,      // id_file
+			record.ID,            // id_permohonan
+			record.ID,            // id_from_csv
+			record.Path,          // filepath
+			record.Size,          // file_size
+			record.FileType,      // file_type
+			"",                   // bucketpath (to be set during upload)
 			string(metadataJSON), // f_metadata
-			"migrator",         // userid
-			now,               // created_at
-			record.StrKey,     // str_key
-			record.StrSubKey,  // str_subkey
-			now,               // timestamp
-			"pending",         // status
+			"migrator",           // userid
+			now,                  // created_at
+			record.StrKey,        // str_key
+			record.StrSubKey,     // str_subkey
+			now,                  // timestamp
+			"pending",            // status
 		)
 		if err != nil {
 			return err
@@ -455,7 +480,8 @@ func (db *DB) GetProjectFiles(projectName string) ([]models.FileRecord, error) {
 		SELECT 
 			filepath, 
 			COALESCE(status, '') as status,
-			COALESCE(timestamp, '') as timestamp
+			COALESCE(timestamp, '') as timestamp,
+			COALESCE(f_metadata, '') as f_metadata
 		FROM files
 		WHERE project_name = ?
 	`, projectName)
@@ -468,11 +494,20 @@ func (db *DB) GetProjectFiles(projectName string) ([]models.FileRecord, error) {
 	for rows.Next() {
 		var file models.FileRecord
 		var timestamp string
-		err := rows.Scan(&file.FilePath, &file.UploadStatus, &timestamp)
+		var metadataStr string
+		err := rows.Scan(&file.FilePath, &file.UploadStatus, &timestamp, &metadataStr)
 		if err != nil {
 			return nil, err
 		}
 		file.Timestamp, _ = time.Parse("2006-01-02 15:04:05", timestamp)
+
+		// Parse metadata if present
+		if metadataStr != "" {
+			if err := json.Unmarshal([]byte(metadataStr), &file.Metadata); err != nil {
+				return nil, fmt.Errorf("failed to parse metadata for file %s: %v", file.FilePath, err)
+			}
+		}
+
 		files = append(files, file)
 	}
 	return files, rows.Err()
@@ -498,10 +533,10 @@ func (db *DB) AddFileFromCSV(projectName, idFile, idPermohonan, timestamp, fileP
 
 // MissingFile represents a file that was in the CSV but not found on disk
 type MissingFile struct {
-	ID        int64
-	FilePath  string
-	IDUpload  string
-	CSVLine   int
+	ID         int64
+	FilePath   string
+	IDUpload   string
+	CSVLine    int
 	ReportedAt time.Time
 }
 
