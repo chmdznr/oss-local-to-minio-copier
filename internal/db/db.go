@@ -46,34 +46,31 @@ func (db *DB) initialize() error {
 			secret_key TEXT
 		);
 		CREATE TABLE IF NOT EXISTS files (
-			project_name TEXT,
-			id_file TEXT,           -- ID from file uploaded to MINIO
-			id_permohonan TEXT,     -- Application ID
-			id_from_csv TEXT,       -- ID field from CSV
-			file_path TEXT,
-			file_size INTEGER,
-			file_type TEXT,         -- File type uploaded to MINIO
-			bucketpath TEXT,        -- bucket + path
-			f_metadata TEXT,        -- JSON metadata
-			userid TEXT,            -- User ID (migrator)
-			created_at DATETIME,    -- Upload time to MINIO
-			str_key TEXT,           -- Application ID
-			str_subkey TEXT,
-			timestamp DATETIME,
-			upload_status TEXT,
-			PRIMARY KEY (project_name, file_path)
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			project_name TEXT NOT NULL,
+			id_file TEXT,
+			id_permohonan TEXT,
+			timestamp TEXT,
+			filepath TEXT NOT NULL,
+			status TEXT DEFAULT 'pending',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
-		CREATE INDEX IF NOT EXISTS idx_files_status ON files(project_name, upload_status);
-		CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(project_name, timestamp);
-		CREATE INDEX IF NOT EXISTS idx_files_id_file ON files(id_file);
-		CREATE INDEX IF NOT EXISTS idx_files_id_permohonan ON files(id_permohonan);
+		DROP TABLE IF EXISTS missing_files;
 		CREATE TABLE IF NOT EXISTS missing_files (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			filepath TEXT NOT NULL,
+			id_upload TEXT NOT NULL,
 			csv_line INTEGER,
 			reported_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
+		CREATE INDEX IF NOT EXISTS idx_files_project_name ON files(project_name);
+		CREATE INDEX IF NOT EXISTS idx_files_filepath ON files(filepath);
 		CREATE INDEX IF NOT EXISTS idx_missing_files_filepath ON missing_files(filepath);
+		CREATE INDEX IF NOT EXISTS idx_missing_files_id_upload ON missing_files(id_upload);
+		CREATE INDEX IF NOT EXISTS idx_files_status ON files(project_name, status);
+		CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(project_name, timestamp);
+		CREATE INDEX IF NOT EXISTS idx_files_id_file ON files(id_file);
+		CREATE INDEX IF NOT EXISTS idx_files_id_permohonan ON files(id_permohonan);
 		PRAGMA journal_mode=WAL;
 		PRAGMA synchronous=NORMAL;
 		PRAGMA temp_store=MEMORY;
@@ -126,22 +123,13 @@ func (db *DB) CreateProject(project *models.Project) error {
 func (db *DB) GetPendingFiles(projectName string) ([]models.FileRecord, error) {
 	rows, err := db.Query(`
 		SELECT 
-			file_path,
+			filepath,
 			COALESCE(id_file, '') as id_file,
 			COALESCE(id_permohonan, '') as id_permohonan,
-			COALESCE(id_from_csv, '') as id_from_csv,
-			COALESCE(file_size, 0) as file_size,
-			COALESCE(file_type, '') as file_type,
-			COALESCE(bucketpath, '') as bucketpath,
-			COALESCE(f_metadata, '{}') as f_metadata,
-			COALESCE(userid, 'migrator') as userid,
-			COALESCE(created_at, CURRENT_TIMESTAMP) as created_at,
-			COALESCE(str_key, '') as str_key,
-			COALESCE(str_subkey, '') as str_subkey,
-			COALESCE(timestamp, CURRENT_TIMESTAMP) as timestamp,
-			COALESCE(upload_status, 'pending') as upload_status
+			COALESCE(timestamp, '') as timestamp,
+			COALESCE(status, '') as status
 		FROM files
-		WHERE project_name = ? AND (upload_status = 'pending' OR upload_status = 'failed')
+		WHERE project_name = ? AND (status = 'pending' OR status = 'failed')
 	`, projectName)
 	if err != nil {
 		return nil, err
@@ -152,20 +140,10 @@ func (db *DB) GetPendingFiles(projectName string) ([]models.FileRecord, error) {
 	for rows.Next() {
 		var file models.FileRecord
 		var timestamp string
-		var createdAt string
 		err := rows.Scan(
 			&file.FilePath,
 			&file.IDFile,
 			&file.IDPermohonan,
-			&file.IDFromCSV,
-			&file.Size,
-			&file.FileType,
-			&file.BucketPath,
-			&file.Metadata,
-			&file.UserID,
-			&createdAt,
-			&file.StrKey,
-			&file.StrSubKey,
 			&timestamp,
 			&file.UploadStatus,
 		)
@@ -174,7 +152,6 @@ func (db *DB) GetPendingFiles(projectName string) ([]models.FileRecord, error) {
 		}
 
 		// Parse timestamps
-		file.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
 		file.Timestamp, _ = time.Parse("2006-01-02 15:04:05", timestamp)
 
 		files = append(files, file)
@@ -188,10 +165,10 @@ func (db *DB) UpdateFileStatus(projectName, filePath, status string) error {
 	_, err := db.Exec(`
 		UPDATE files 
 		SET 
-			upload_status = ?,
+			status = ?,
 			timestamp = ?,
 			created_at = ?
-		WHERE project_name = ? AND file_path = ?
+		WHERE project_name = ? AND filepath = ?
 	`, status, now, now, projectName, filePath)
 	return err
 }
@@ -208,10 +185,10 @@ func (db *DB) UpdateFileStatusBatch(projectName string, filePaths []string, stat
 	stmt, err := tx.Prepare(`
 		UPDATE files 
 		SET 
-			upload_status = ?,
+			status = ?,
 			timestamp = ?,
 			created_at = ?
-		WHERE project_name = ? AND file_path = ?
+		WHERE project_name = ? AND filepath = ?
 	`)
 	if err != nil {
 		return err
@@ -231,9 +208,9 @@ func (db *DB) UpdateFileStatusBatch(projectName string, filePaths []string, stat
 // SaveFileRecord saves a file record
 func (db *DB) SaveFileRecord(projectName string, record *models.FileRecord) error {
 	_, err := db.Exec(`
-		INSERT OR REPLACE INTO files (project_name, file_path, file_size, timestamp, upload_status)
-		VALUES (?, ?, ?, ?, ?)
-	`, projectName, record.FilePath, record.Size, record.Timestamp, record.UploadStatus)
+		INSERT OR REPLACE INTO files (project_name, filepath, status, timestamp)
+		VALUES (?, ?, ?, ?)
+	`, projectName, record.FilePath, record.UploadStatus, record.Timestamp)
 	return err
 }
 
@@ -246,8 +223,8 @@ func (db *DB) SaveFileRecordsBatch(projectName string, records []models.FileReco
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT OR REPLACE INTO files (project_name, file_path, file_size, timestamp, upload_status)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT OR REPLACE INTO files (project_name, filepath, status, timestamp)
+		VALUES (?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -258,9 +235,8 @@ func (db *DB) SaveFileRecordsBatch(projectName string, records []models.FileReco
 		_, err = stmt.Exec(
 			projectName,
 			record.FilePath,
-			record.Size,
-			record.Timestamp,
 			record.UploadStatus,
+			record.Timestamp,
 		)
 		if err != nil {
 			return err
@@ -286,7 +262,7 @@ func (db *DB) GetFileStats(projectName string) (totalFiles, totalSize, uploadedF
 	err = db.QueryRow(`
 		SELECT COUNT(*), COALESCE(SUM(file_size), 0)
 		FROM files
-		WHERE project_name = ? AND upload_status = 'uploaded'
+		WHERE project_name = ? AND status = 'uploaded'
 	`, projectName).Scan(&uploadedFiles, &uploadedSize)
 	if err != nil {
 		return 0, 0, 0, 0, err
@@ -302,10 +278,10 @@ func (db *DB) GetStats(projectName string) (*models.Stats, error) {
 		SELECT 
 			COUNT(*) as total_files,
 			COALESCE(SUM(file_size), 0) as total_size,
-			COUNT(CASE WHEN upload_status = 'uploaded' THEN 1 END) as uploaded_files,
-			COALESCE(SUM(CASE WHEN upload_status = 'uploaded' THEN file_size ELSE 0 END), 0) as uploaded_size,
-			COUNT(CASE WHEN upload_status = 'pending' THEN 1 END) as pending_files,
-			COALESCE(SUM(CASE WHEN upload_status = 'pending' THEN file_size ELSE 0 END), 0) as pending_size
+			COUNT(CASE WHEN status = 'uploaded' THEN 1 END) as uploaded_files,
+			COALESCE(SUM(CASE WHEN status = 'uploaded' THEN file_size ELSE 0 END), 0) as uploaded_size,
+			COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_files,
+			COALESCE(SUM(CASE WHEN status = 'pending' THEN file_size ELSE 0 END), 0) as pending_size
 		FROM files 
 		WHERE project_name = ?
 	`, projectName).Scan(
@@ -326,9 +302,9 @@ func (db *DB) GetStats(projectName string) (*models.Stats, error) {
 func (db *DB) GetFileByPath(projectName string, filePath string) (*models.FileRecord, error) {
 	var record models.FileRecord
 	err := db.QueryRow(
-		"SELECT file_path, file_size, timestamp, upload_status FROM files WHERE project_name = ? AND file_path = ?",
+		"SELECT filepath, status, timestamp FROM files WHERE project_name = ? AND filepath = ?",
 		projectName, filePath,
-	).Scan(&record.FilePath, &record.Size, &record.Timestamp, &record.UploadStatus)
+	).Scan(&record.FilePath, &record.UploadStatus, &record.Timestamp)
 
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -355,38 +331,34 @@ func (db *DB) SaveFileRecordFromCSV(projectName string, csvRecord *models.CSVRec
 
 	_, err = db.Exec(`
 		INSERT INTO files (
-			project_name, id_file, id_permohonan, id_from_csv, file_path, file_type,
+			project_name, id_file, id_permohonan, timestamp, filepath, status,
 			bucketpath, f_metadata, userid, created_at, str_key,
-			str_subkey, timestamp, upload_status
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(project_name, file_path) DO UPDATE SET
+			str_subkey
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(project_name, filepath) DO UPDATE SET
 			id_file = excluded.id_file,
 			id_permohonan = excluded.id_permohonan,
-			id_from_csv = excluded.id_from_csv,
-			file_type = excluded.file_type,
+			timestamp = excluded.timestamp,
+			status = excluded.status,
 			bucketpath = excluded.bucketpath,
 			f_metadata = excluded.f_metadata,
 			userid = excluded.userid,
 			created_at = excluded.created_at,
 			str_key = excluded.str_key,
-			str_subkey = excluded.str_subkey,
-			timestamp = excluded.timestamp,
-			upload_status = excluded.upload_status
+			str_subkey = excluded.str_subkey
 	`,
 		projectName,
 		csvRecord.IDUpload,   // id_file
 		csvRecord.StrKey,     // id_permohonan
-		csvRecord.ID,         // id_from_csv
-		csvRecord.Path,       // file_path
-		csvRecord.FileType,   // file_type
+		time.Now(),           // timestamp
+		csvRecord.Path,       // filepath
+		"pending",            // status
 		"",                   // bucketpath (to be set during upload)
 		string(metadataJSON), // f_metadata
 		"migrator",           // userid
 		time.Now(),           // created_at
 		csvRecord.StrKey,     // str_key
 		csvRecord.StrSubKey,  // str_subkey
-		time.Now(),           // timestamp
-		"pending",            // upload_status
 	)
 
 	return err
@@ -409,23 +381,21 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO files (
-			project_name, file_path, id_file, id_permohonan, id_from_csv,
-			file_size, file_type, bucketpath, f_metadata,
-			userid, created_at, str_key, str_subkey, upload_status
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-		ON CONFLICT(project_name, file_path) DO UPDATE SET
+			project_name, filepath, id_file, id_permohonan, timestamp, status,
+			bucketpath, f_metadata, userid, created_at, str_key,
+			str_subkey
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(project_name, filepath) DO UPDATE SET
 			id_file = excluded.id_file,
 			id_permohonan = excluded.id_permohonan,
-			id_from_csv = excluded.id_from_csv,
-			file_size = excluded.file_size,
-			file_type = excluded.file_type,
+			timestamp = excluded.timestamp,
+			status = excluded.status,
 			bucketpath = excluded.bucketpath,
 			f_metadata = excluded.f_metadata,
 			userid = excluded.userid,
 			created_at = excluded.created_at,
 			str_key = excluded.str_key,
-			str_subkey = excluded.str_subkey,
-			upload_status = 'pending'
+			str_subkey = excluded.str_subkey
 	`)
 	if err != nil {
 		return err
@@ -460,9 +430,8 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 			record.Path,
 			record.IDUpload,
 			record.ID,
-			idFromCSV, // id_from_csv
-			record.Size,
-			record.FileType,
+			now,
+			"pending",
 			bucketPath,
 			string(metadataJSON),
 			"migrator",
@@ -482,11 +451,9 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 func (db *DB) GetProjectFiles(projectName string) ([]models.FileRecord, error) {
 	rows, err := db.Query(`
 		SELECT 
-			file_path, 
-			COALESCE(file_size, 0) as file_size,
-			COALESCE(file_type, '') as file_type,
-			COALESCE(bucketpath, '') as bucketpath,
-			COALESCE(f_metadata, '{}') as f_metadata
+			filepath, 
+			COALESCE(status, '') as status,
+			COALESCE(timestamp, '') as timestamp
 		FROM files
 		WHERE project_name = ?
 	`, projectName)
@@ -498,11 +465,12 @@ func (db *DB) GetProjectFiles(projectName string) ([]models.FileRecord, error) {
 	var files []models.FileRecord
 	for rows.Next() {
 		var file models.FileRecord
-		var metadataStr string
-		err := rows.Scan(&file.FilePath, &file.Size, &file.FileType, &file.BucketPath, &metadataStr)
+		var timestamp string
+		err := rows.Scan(&file.FilePath, &file.UploadStatus, &timestamp)
 		if err != nil {
 			return nil, err
 		}
+		file.Timestamp, _ = time.Parse("2006-01-02 15:04:05", timestamp)
 		files = append(files, file)
 	}
 	return files, rows.Err()
@@ -513,7 +481,7 @@ func (db *DB) UpdateFileMetadata(projectName, filePath, metadata string) error {
 	_, err := db.Exec(`
 		UPDATE files 
 		SET f_metadata = ?
-		WHERE project_name = ? AND file_path = ?
+		WHERE project_name = ? AND filepath = ?
 	`, metadata, projectName, filePath)
 	return err
 }
@@ -530,14 +498,15 @@ func (db *DB) AddFileFromCSV(projectName, idFile, idPermohonan, timestamp, fileP
 type MissingFile struct {
 	ID        int64
 	FilePath  string
+	IDUpload  string
 	CSVLine   int
 	ReportedAt time.Time
 }
 
 // AddMissingFile adds a record of a missing file
-func (db *DB) AddMissingFile(filePath string, csvLine int) error {
-	query := `INSERT INTO missing_files (filepath, csv_line) VALUES (?, ?)`
-	_, err := db.Exec(query, filePath, csvLine)
+func (db *DB) AddMissingFile(filePath string, idUpload string, csvLine int) error {
+	query := `INSERT INTO missing_files (filepath, id_upload, csv_line) VALUES (?, ?, ?)`
+	_, err := db.Exec(query, filePath, idUpload, csvLine)
 	return err
 }
 
@@ -550,7 +519,7 @@ func (db *DB) GetMissingFilesCount() (int, error) {
 
 // GetMissingFiles returns all missing files
 func (db *DB) GetMissingFiles() ([]MissingFile, error) {
-	query := `SELECT id, filepath, csv_line, reported_at FROM missing_files ORDER BY csv_line`
+	query := `SELECT id, filepath, id_upload, csv_line, reported_at FROM missing_files ORDER BY csv_line`
 	rows, err := db.Query(query)
 	if err != nil {
 		return nil, err
@@ -560,7 +529,7 @@ func (db *DB) GetMissingFiles() ([]MissingFile, error) {
 	var files []MissingFile
 	for rows.Next() {
 		var f MissingFile
-		err := rows.Scan(&f.ID, &f.FilePath, &f.CSVLine, &f.ReportedAt)
+		err := rows.Scan(&f.ID, &f.FilePath, &f.IDUpload, &f.CSVLine, &f.ReportedAt)
 		if err != nil {
 			return nil, err
 		}

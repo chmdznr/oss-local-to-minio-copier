@@ -373,6 +373,7 @@ func importCSV(c *cli.Context) error {
 	fmt.Println("Starting import process...")
 	fmt.Println("Checking files and collecting sizes...")
 
+	lineNum := 2 // Start from 2 to account for header row
 	for {
 		row, err := reader.Read()
 		if err == io.EOF {
@@ -388,6 +389,7 @@ func importCSV(c *cli.Context) error {
 		}
 
 		filePath := row[headerMap["path"]]
+		idUpload := row[headerMap["id_upload"]]
 		fullPath := filepath.Join(project.SourcePath, filePath)
 
 		// Check if file exists and get its info
@@ -395,9 +397,10 @@ func importCSV(c *cli.Context) error {
 		if err != nil {
 			if os.IsNotExist(err) {
 				skippedCount++
-				if err := db.AddMissingFile(fullPath, recordCount+2); err != nil {
+				if err := db.AddMissingFile(fullPath, idUpload, lineNum); err != nil {
 					log.Printf("Error recording missing file: %v", err)
 				}
+				lineNum++
 				continue
 			}
 			return fmt.Errorf("failed to get file info for %s: %v", filePath, err)
@@ -406,11 +409,12 @@ func importCSV(c *cli.Context) error {
 		// Skip directories
 		if fileInfo.IsDir() {
 			skippedCount++
+			lineNum++
 			continue
 		}
 
 		record := models.CSVRecord{
-			IDUpload:     row[headerMap["id_upload"]],
+			IDUpload:     idUpload,
 			Path:         filePath,
 			NamaModul:    row[headerMap["nama_modul"]],
 			FileType:     row[headerMap["file_type"]],
@@ -442,6 +446,7 @@ func importCSV(c *cli.Context) error {
 				skippedCount,
 			)
 		}
+		lineNum++
 	}
 
 	fmt.Printf("\nImport completed:\n")
