@@ -298,6 +298,20 @@ func importCSV(c *cli.Context) error {
 	projectName := c.String("project")
 	csvPath := c.String("csv")
 	sourcePath := c.String("source")
+	batchSize := c.Int("batch")
+
+	if projectName == "" {
+		return fmt.Errorf("project name is required")
+	}
+	if csvPath == "" {
+		return fmt.Errorf("CSV file path is required")
+	}
+	if sourcePath == "" {
+		return fmt.Errorf("source directory path is required")
+	}
+	if batchSize <= 0 {
+		batchSize = 1000 // default batch size
+	}
 
 	// Open database connection
 	db, err := db.New(projectName)
@@ -326,11 +340,18 @@ func importCSV(c *cli.Context) error {
 	// Initialize counters
 	processed := 0
 	missing := 0
+	batch := make([][]string, 0, batchSize)
 
 	// Process each row
 	for lineNum := 2; ; lineNum++ { // Start from 2 to account for header row
 		record, err := reader.Read()
 		if err == io.EOF {
+			// Process remaining batch
+			if len(batch) > 0 {
+				if err := processBatch(db, projectName, sourcePath, batch, &processed, &missing); err != nil {
+					return err
+				}
+			}
 			break
 		}
 		if err != nil {
@@ -341,27 +362,40 @@ func importCSV(c *cli.Context) error {
 			return fmt.Errorf("invalid CSV format at line %d: expected at least 4 columns", lineNum)
 		}
 
-		filePath := filepath.Join(sourcePath, record[3])
-		
-		// Check if file exists
-		if _, err := os.Stat(filePath); os.IsNotExist(err) {
-			if err := db.AddMissingFile(filePath, lineNum); err != nil {
-				log.Printf("Error recording missing file: %v", err)
+		batch = append(batch, record)
+		if len(batch) >= batchSize {
+			if err := processBatch(db, projectName, sourcePath, batch, &processed, &missing); err != nil {
+				return err
 			}
-			missing++
-			continue
+			batch = batch[:0] // Clear batch
 		}
-
-		// Add file to database
-		if err := db.AddFileFromCSV(projectName, record[0], record[1], record[2], filePath); err != nil {
-			return fmt.Errorf("error adding file at line %d: %v", lineNum, err)
-		}
-		processed++
 	}
 
 	fmt.Printf("\nImport Summary:\n")
 	fmt.Printf("- Successfully processed: %d files\n", processed)
 	fmt.Printf("- Missing files: %d\n", missing)
 
+	return nil
+}
+
+func processBatch(db *db.DB, projectName, sourcePath string, batch [][]string, processed, missing *int) error {
+	for _, record := range batch {
+		filePath := filepath.Join(sourcePath, record[3])
+		
+		// Check if file exists
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			if err := db.AddMissingFile(filePath, 0); err != nil {
+				log.Printf("Error recording missing file: %v", err)
+			}
+			*missing++
+			continue
+		}
+
+		// Add file to database
+		if err := db.AddFileFromCSV(projectName, record[0], record[1], record[2], filePath); err != nil {
+			return fmt.Errorf("error adding file: %v", err)
+		}
+		*processed++
+	}
 	return nil
 }
