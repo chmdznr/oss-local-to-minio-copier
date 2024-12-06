@@ -13,14 +13,33 @@ import (
 	"github.com/chmdznr/oss-local-to-minio-copier/internal/sync"
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/models"
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/utils"
+	"github.com/chmdznr/oss-local-to-minio-copier/pkg/version"
 	"github.com/urfave/cli/v2"
 )
 
 func main() {
+	cli.VersionFlag = &cli.BoolFlag{
+		Name:    "version",
+		Aliases: []string{"v"},
+		Usage:   "print the version",
+	}
+
 	app := &cli.App{
-		Name:  "msync",
-		Usage: "MinIO sync tool for local to remote synchronization",
+		Name:                 "msync",
+		Usage:                "MinIO sync tool for local to remote synchronization",
+		Version:             version.Version,
+		EnableBashCompletion: true,
 		Commands: []*cli.Command{
+			{
+				Name:  "version",
+				Usage: "Print detailed version information",
+				Action: func(c *cli.Context) error {
+					fmt.Printf("Version:    %s\n", version.Version)
+					fmt.Printf("Git commit: %s\n", version.GitCommit)
+					fmt.Printf("Built:      %s\n", version.BuildTime)
+					return nil
+				},
+			},
 			{
 				Name:  "create",
 				Usage: "Create a new sync project",

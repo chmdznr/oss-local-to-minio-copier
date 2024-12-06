@@ -51,10 +51,31 @@ Clone the repository and build:
 git clone https://github.com/chmdznr/oss-local-to-minio-copier.git
 cd oss-local-to-minio-copier
 go mod tidy
-go build -o msync.exe ./cmd/msync
+
+# On Windows
+scripts/build.bat
+
+# On Unix-like systems (Linux, macOS)
+chmod +x scripts/build.sh  # Make script executable (first time only)
+./scripts/build.sh
 ```
 
-The compiled binary will be created as `msync.exe` in the current directory.
+The compiled binary will be created as:
+- Windows: `msync.exe`
+- Unix: `msync`
+
+## Version Information
+
+You can check the version of msync using either:
+```bash
+msync --version        # Shows short version
+msync version         # Shows detailed version information
+```
+
+The version output includes:
+- Version number (e.g., v1.0.1)
+- Git commit hash
+- Build timestamp
 
 ## Usage
 
