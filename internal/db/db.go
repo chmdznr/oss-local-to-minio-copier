@@ -35,12 +35,13 @@ func New(projectName string) (*DB, error) {
 // initialize creates the necessary tables if they don't exist
 func (db *DB) initialize() error {
 	_, err := db.Exec(`
+		DROP TABLE IF EXISTS files;
 		CREATE TABLE IF NOT EXISTS projects (
 			name TEXT PRIMARY KEY,
-			source_path TEXT,
-			endpoint TEXT,
-			bucket TEXT,
-			folder TEXT,
+			source_path TEXT NOT NULL,
+			endpoint TEXT NOT NULL,
+			bucket TEXT NOT NULL,
+			folder TEXT NOT NULL,
 			access_key TEXT,
 			secret_key TEXT
 		);
@@ -61,7 +62,8 @@ func (db *DB) initialize() error {
 			str_key TEXT,
 			str_subkey TEXT,
 			timestamp TEXT,
-			status TEXT DEFAULT 'pending'
+			status TEXT DEFAULT 'pending',
+			UNIQUE(project_name, filepath)
 		);
 
 		DROP TABLE IF EXISTS missing_files;
