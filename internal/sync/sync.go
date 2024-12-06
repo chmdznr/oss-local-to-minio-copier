@@ -233,6 +233,14 @@ func (s *Syncer) uploadFile(ctx context.Context, file *models.File) error {
 		encodedKey := url.QueryEscape(strings.TrimSpace(k))
 		encodedValue := url.QueryEscape(strings.TrimSpace(v))
 		if encodedValue != "" {
+			// For x-amz-meta-path, we need to encode each path segment
+			if strings.ToLower(k) == "path" {
+				pathSegments := strings.Split(v, "/")
+				for i, segment := range pathSegments {
+					pathSegments[i] = url.PathEscape(segment)
+				}
+				encodedValue = strings.Join(pathSegments, "/")
+			}
 			sanitizedMetadata[encodedKey] = encodedValue
 		}
 	}
@@ -255,7 +263,7 @@ func (s *Syncer) uploadFile(ctx context.Context, file *models.File) error {
 	maxRetries := 3
 	var uploadErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		_, uploadErr = s.minioClient.PutObject(
+		info, uploadErr := s.minioClient.PutObject(
 			ctx,
 			s.project.Destination.Bucket,
 			destPath,
@@ -265,7 +273,10 @@ func (s *Syncer) uploadFile(ctx context.Context, file *models.File) error {
 		)
 
 		if uploadErr == nil {
-			break
+			// Update file status on successful upload
+			if info.Size > 0 {
+				return nil
+			}
 		}
 
 		// Log detailed error information
@@ -404,7 +415,8 @@ func (s *Syncer) SyncFiles() error {
 					opts.ContentType = "application/zip"
 				}
 
-				_, err := s.minioClient.FPutObject(
+				// Upload file with retries and verification
+				objInfo, err := s.minioClient.FPutObject(
 					context.Background(),
 					s.project.Destination.Bucket,
 					job.destinationPath,
@@ -414,7 +426,7 @@ func (s *Syncer) SyncFiles() error {
 
 				if err != nil {
 					// Log detailed error information
-					log.Printf("\nFailed to upload %s:\n", job.filePath)
+					log.Printf("\nFailed to upload %s (attempt %d):\n", job.filePath, 1)
 					log.Printf("  Local path: %s\n", fullPath)
 					log.Printf("  Destination: %s/%s\n", s.project.Destination.Bucket, job.destinationPath)
 					log.Printf("  Error: %v\n", err)
@@ -435,7 +447,18 @@ func (s *Syncer) SyncFiles() error {
 					continue
 				}
 
-				// After successful upload, update the metadata in database
+				// Verify upload was successful by checking object info
+				if objInfo.Size != job.size {
+					log.Printf("\nWarning: Uploaded file size mismatch for %s:\n", job.filePath)
+					log.Printf("  Expected: %d bytes\n", job.size)
+					log.Printf("  Actual: %d bytes\n", objInfo.Size)
+					if dbErr := s.db.UpdateFileStatus(s.project.Name, job.filePath, "failed"); dbErr != nil {
+						log.Printf("Failed to update status for %s: %v\n", job.filePath, dbErr)
+					}
+					continue
+				}
+
+				// After successful upload and verification, update the metadata in database
 				metadataJSON, err := json.Marshal(job.metadata)
 				if err != nil {
 					log.Printf("\nWarning: Failed to marshal metadata for %s: %v\n", job.filePath, err)
