@@ -10,6 +10,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,10 +57,8 @@ func NewSyncer(db *db.DB, project *models.Project, config *SyncerConfig) (*Synce
 
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
-			// For Google Cloud Storage and similar services
 			MinVersion: tls.VersionTLS12,
 		},
-		// Add timeouts
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -70,12 +69,16 @@ func NewSyncer(db *db.DB, project *models.Project, config *SyncerConfig) (*Synce
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
-	// Create MinIO client with custom transport
-	minioClient, err := minio.New(project.Destination.Endpoint, &minio.Options{
-		Creds:     credentials.NewStaticV4(project.Destination.AccessKey, project.Destination.SecretKey, ""),
-		Secure:    true,
-		Transport: tr,
-	})
+	// Create MinIO client with custom transport and proper region
+	opts := minio.Options{
+		Creds:        credentials.NewStaticV4(project.Destination.AccessKey, project.Destination.SecretKey, ""),
+		Secure:       true,
+		Transport:    tr,
+		Region:       "auto", // Let MinIO detect the region
+		BucketLookup: minio.BucketLookupAuto,
+	}
+
+	minioClient, err := minio.New(project.Destination.Endpoint, &opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize MinIO client: %v", err)
 	}
@@ -223,26 +226,25 @@ func (s *Syncer) uploadFile(ctx context.Context, file *models.File) error {
 		}
 	}
 
-	// Sanitize metadata
+	// Sanitize metadata - encode special characters
 	sanitizedMetadata := make(map[string]string)
 	for k, v := range file.Metadata {
-		// Remove non-printable characters and normalize spaces
-		sanitizedValue := strings.Map(func(r rune) rune {
-			if unicode.IsPrint(r) {
-				return r
-			}
-			return -1
-		}, v)
-		sanitizedValue = strings.TrimSpace(sanitizedValue)
-		if sanitizedValue != "" {
-			sanitizedMetadata[k] = sanitizedValue
+		// URL encode the values to handle special characters
+		encodedValue := url.QueryEscape(strings.TrimSpace(v))
+		if encodedValue != "" {
+			sanitizedMetadata[k] = encodedValue
 		}
 	}
 
-	// Prepare upload options
+	// Add content disposition to force download with original filename
+	originalFilename := filepath.Base(file.LocalPath)
+	contentDisposition := fmt.Sprintf("attachment; filename*=UTF-8''%s", url.QueryEscape(originalFilename))
+
+	// Prepare upload options with proper headers
 	opts := minio.PutObjectOptions{
-		ContentType:  contentType,
-		UserMetadata: sanitizedMetadata,
+		ContentType:        contentType,
+		ContentDisposition: contentDisposition,
+		UserMetadata:      sanitizedMetadata,
 	}
 
 	// Attempt the upload with retry logic
@@ -278,6 +280,10 @@ func (s *Syncer) uploadFile(ctx context.Context, file *models.File) error {
 				return fmt.Errorf("bucket %s does not exist: %v", s.project.Destination.Bucket, uploadErr)
 			case "InvalidAccessKeyId":
 				return fmt.Errorf("invalid access key: %v", uploadErr)
+			case "SignatureDoesNotMatch":
+				// Log additional details for signature mismatch
+				log.Printf("Signature mismatch details - Region: %s, Endpoint: %s", 
+					minioErr.Region, s.project.Destination.Endpoint)
 			}
 		}
 
@@ -287,8 +293,8 @@ func (s *Syncer) uploadFile(ctx context.Context, file *models.File) error {
 			if err != nil {
 				return fmt.Errorf("failed to reset file for retry: %v", err)
 			}
-			// Wait before retrying
-			time.Sleep(time.Duration(attempt) * time.Second)
+			// Wait before retrying with exponential backoff
+			time.Sleep(time.Duration(attempt*attempt) * time.Second)
 		}
 	}
 
