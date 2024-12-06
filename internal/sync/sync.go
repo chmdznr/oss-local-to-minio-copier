@@ -226,19 +226,23 @@ func (s *Syncer) uploadFile(ctx context.Context, file *models.File) error {
 		}
 	}
 
-	// Sanitize metadata - encode special characters
+	// Sanitize metadata - encode both keys and values
 	sanitizedMetadata := make(map[string]string)
 	for k, v := range file.Metadata {
-		// URL encode the values to handle special characters
+		// URL encode both keys and values to handle special characters
+		encodedKey := url.QueryEscape(strings.TrimSpace(k))
 		encodedValue := url.QueryEscape(strings.TrimSpace(v))
 		if encodedValue != "" {
-			sanitizedMetadata[k] = encodedValue
+			sanitizedMetadata[encodedKey] = encodedValue
 		}
 	}
 
 	// Add content disposition to force download with original filename
+	// Use RFC 5987 encoding for the filename
 	originalFilename := filepath.Base(file.LocalPath)
-	contentDisposition := fmt.Sprintf("attachment; filename*=UTF-8''%s", url.QueryEscape(originalFilename))
+	contentDisposition := fmt.Sprintf("attachment; filename=\"%s\"; filename*=UTF-8''%s", 
+		strings.ReplaceAll(originalFilename, "\"", "\\\""),
+		url.PathEscape(originalFilename))
 
 	// Prepare upload options with proper headers
 	opts := minio.PutObjectOptions{
@@ -540,7 +544,7 @@ func (s *Syncer) SyncFiles() error {
 }
 
 func sanitizePath(path string) string {
-	// Remove any non-printable characters and normalize spaces
+	// First clean the path by removing non-printable characters
 	sanitized := strings.Map(func(r rune) rune {
 		if unicode.IsPrint(r) {
 			return r
@@ -548,5 +552,14 @@ func sanitizePath(path string) string {
 		return -1
 	}, path)
 	sanitized = strings.TrimSpace(sanitized)
-	return sanitized
+
+	// Split path into segments and encode each segment
+	segments := strings.Split(sanitized, "/")
+	for i, segment := range segments {
+		// URL encode each segment, preserving forward slashes
+		segments[i] = url.PathEscape(segment)
+	}
+
+	// Rejoin the path with forward slashes
+	return strings.Join(segments, "/")
 }
