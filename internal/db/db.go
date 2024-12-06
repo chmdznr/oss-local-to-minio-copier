@@ -135,7 +135,8 @@ func (db *DB) GetPendingFiles(projectName string) ([]models.FileRecord, error) {
 			COALESCE(id_file, '') as id_file,
 			COALESCE(id_permohonan, '') as id_permohonan,
 			COALESCE(timestamp, '') as timestamp,
-			COALESCE(status, '') as status
+			COALESCE(status, '') as status,
+			COALESCE(file_size, 0) as file_size
 		FROM files
 		WHERE project_name = ? AND (status = 'pending' OR status = 'failed')
 	`, projectName)
@@ -154,6 +155,7 @@ func (db *DB) GetPendingFiles(projectName string) ([]models.FileRecord, error) {
 			&file.IDPermohonan,
 			&timestamp,
 			&file.UploadStatus,
+			&file.Size,
 		)
 		if err != nil {
 			return nil, err
