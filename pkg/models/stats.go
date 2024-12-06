@@ -8,4 +8,6 @@ type Stats struct {
 	UploadedSize  int64
 	PendingFiles  int64
 	PendingSize   int64
+	FailedFiles   int64
+	FailedSize    int64
 }

@@ -291,7 +291,9 @@ func (db *DB) GetStats(projectName string) (*models.Stats, error) {
 			COUNT(CASE WHEN status = 'uploaded' THEN 1 END) as uploaded_files,
 			COALESCE(SUM(CASE WHEN status = 'uploaded' THEN file_size ELSE 0 END), 0) as uploaded_size,
 			COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_files,
-			COALESCE(SUM(CASE WHEN status = 'pending' THEN file_size ELSE 0 END), 0) as pending_size
+			COALESCE(SUM(CASE WHEN status = 'pending' THEN file_size ELSE 0 END), 0) as pending_size,
+			COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_files,
+			COALESCE(SUM(CASE WHEN status = 'failed' THEN file_size ELSE 0 END), 0) as failed_size
 		FROM files 
 		WHERE project_name = ?
 	`, projectName).Scan(
@@ -301,6 +303,8 @@ func (db *DB) GetStats(projectName string) (*models.Stats, error) {
 		&stats.UploadedSize,
 		&stats.PendingFiles,
 		&stats.PendingSize,
+		&stats.FailedFiles,
+		&stats.FailedSize,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get stats: %v", err)
