@@ -471,32 +471,22 @@ func (s *Syncer) SyncFiles() error {
 					}
 				}
 
+				// Update status immediately for this file
+				if err := s.db.UpdateFileStatus(s.project.Name, job.filePath, "uploaded"); err != nil {
+					log.Printf("\nWarning: Failed to update status for %s: %v\n", job.filePath, err)
+				}
+
 				completedFiles = append(completedFiles, job.filePath)
 				progress.Update(job.size, job.isRetry)
 				progress.Print()
 
-				// Update status in batches
+				// Update progress in batches
 				if len(completedFiles) >= s.batchSize {
-					results <- completedFiles
 					completedFiles = nil
 				}
 			}
-
-			if len(completedFiles) > 0 {
-				results <- completedFiles
-			}
 		}()
 	}
-
-	// Start result processor
-	go func() {
-		for completedFiles := range results {
-			if err := s.db.UpdateFileStatusBatch(s.project.Name, completedFiles, "uploaded"); err != nil {
-				errors <- err
-				return
-			}
-		}
-	}()
 
 	// Send jobs to workers
 	for _, file := range files {
