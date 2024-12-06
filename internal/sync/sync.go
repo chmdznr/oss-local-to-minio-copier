@@ -239,7 +239,21 @@ func (s *Syncer) SyncFiles() error {
 				)
 
 				if err != nil {
-					log.Printf("\nFailed to upload %s: %v\n", job.filePath, err)
+					// Log detailed error information
+					log.Printf("\nFailed to upload %s:\n", job.filePath)
+					log.Printf("  Local path: %s\n", fullPath)
+					log.Printf("  Destination: %s/%s\n", s.project.Destination.Bucket, job.destinationPath)
+					log.Printf("  Error: %v\n", err)
+					
+					// Check if it's a MinIO error
+					if minioErr, ok := err.(minio.ErrorResponse); ok {
+						log.Printf("  MinIO Error Details:\n")
+						log.Printf("    Code: %s\n", minioErr.Code)
+						log.Printf("    Message: %s\n", minioErr.Message)
+						log.Printf("    Key: %s\n", minioErr.Key)
+						log.Printf("    BucketName: %s\n", minioErr.BucketName)
+					}
+					
 					// Mark as failed in database
 					if dbErr := s.db.UpdateFileStatus(s.project.Name, job.filePath, "failed"); dbErr != nil {
 						log.Printf("Failed to update status for %s: %v\n", job.filePath, dbErr)
@@ -309,6 +323,22 @@ func (s *Syncer) SyncFiles() error {
 				metadata["id_profile"] = existingMeta["id_profile"]
 			}
 		}
+
+		// Sanitize destination path - replace problematic characters
+		destinationPath = strings.Map(func(r rune) rune {
+			switch r {
+			case '　': // full-width space
+				return ' ' // replace with regular space
+			case '\u200B', '\uFEFF': // zero-width space and BOM
+				return -1 // remove these characters
+			default:
+				return r
+			}
+		}, destinationPath)
+
+		// Clean the path to ensure proper formatting
+		destinationPath = strings.ReplaceAll(destinationPath, "\\", "/")
+		destinationPath = strings.TrimPrefix(destinationPath, "/")
 
 		jobs <- workItem{
 			filePath:        file.FilePath,
