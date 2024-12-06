@@ -16,7 +16,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"github.com/chmdznr/oss-local-to-minio-copier/internal/db"
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/models"
@@ -383,21 +382,25 @@ func (s *Syncer) SyncFiles() error {
 				// Set metadata if available
 				var opts minio.PutObjectOptions
 				if job.metadata != nil {
-					// Sanitize metadata values
+					// Sanitize metadata values and handle special cases
 					sanitizedMetadata := make(map[string]string)
 					for k, v := range job.metadata {
-						// Remove any non-printable characters and normalize spaces
-						sanitized := strings.Map(func(r rune) rune {
-							if r < 32 || r == 127 { // control characters
-								return -1
+						sanitized := v
+						if k == "path" {
+							// Special handling for path metadata
+							sanitized = sanitizePath(v)
+						} else {
+							// For other metadata values, first decode if already encoded
+							decoded, err := url.QueryUnescape(v)
+							if err == nil {
+								sanitized = decoded
 							}
-							if r == '　' { // full-width space
-								return ' '
-							}
-							return r
-						}, v)
-						
-						// Trim spaces and ensure non-empty value
+							// Replace problematic characters
+							sanitized = strings.ReplaceAll(sanitized, "&", "and")
+							sanitized = strings.ReplaceAll(sanitized, "+", "plus")
+							// Then encode
+							sanitized = url.QueryEscape(sanitized)
+						}
 						sanitized = strings.TrimSpace(sanitized)
 						if sanitized != "" {
 							sanitizedMetadata[k] = sanitized
@@ -567,22 +570,35 @@ func (s *Syncer) SyncFiles() error {
 }
 
 func sanitizePath(path string) string {
-	// First clean the path by removing non-printable characters
-	sanitized := strings.Map(func(r rune) rune {
-		if unicode.IsPrint(r) {
-			return r
-		}
-		return -1
-	}, path)
-	sanitized = strings.TrimSpace(sanitized)
+	// First, replace any backslashes with forward slashes
+	path = strings.ReplaceAll(path, "\\", "/")
 
-	// Split path into segments and encode each segment
-	segments := strings.Split(sanitized, "/")
+	// Split the path into segments
+	segments := strings.Split(path, "/")
+
+	// URL encode each segment individually
 	for i, segment := range segments {
-		// URL encode each segment, preserving forward slashes
-		segments[i] = url.PathEscape(segment)
+		// First decode the segment in case it's already encoded
+		decoded, err := url.QueryUnescape(segment)
+		if err == nil {
+			segment = decoded
+		}
+
+		// Replace problematic characters
+		segment = strings.ReplaceAll(segment, "&", "and")
+		segment = strings.ReplaceAll(segment, "+", "plus")
+
+		// Encode the segment
+		segments[i] = url.QueryEscape(segment)
 	}
 
-	// Rejoin the path with forward slashes
-	return strings.Join(segments, "/")
+	// Join the segments back together
+	sanitized := strings.Join(segments, "/")
+
+	// Remove any double slashes
+	for strings.Contains(sanitized, "//") {
+		sanitized = strings.ReplaceAll(sanitized, "//", "/")
+	}
+
+	return sanitized
 }
