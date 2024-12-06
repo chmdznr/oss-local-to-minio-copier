@@ -1,16 +1,18 @@
 package main
 
 import (
+	"encoding/csv"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/chmdznr/local-to-minio-copier/internal/db"
 	"github.com/chmdznr/local-to-minio-copier/internal/sync"
 	"github.com/chmdznr/local-to-minio-copier/pkg/models"
 	"github.com/chmdznr/local-to-minio-copier/pkg/utils"
-
 	"github.com/urfave/cli/v2"
 )
 
@@ -62,28 +64,6 @@ func main() {
 				Action: createProject,
 			},
 			{
-				Name:  "scan",
-				Usage: "Scan files in project directory",
-				Flags: []cli.Flag{
-					&cli.StringFlag{
-						Name:     "project",
-						Usage:    "Project name",
-						Required: true,
-					},
-					&cli.IntFlag{
-						Name:  "workers",
-						Usage: "Number of parallel workers for scanning files",
-						Value: 8,
-					},
-					&cli.IntFlag{
-						Name:  "batch",
-						Usage: "Batch size for scanning files",
-						Value: 1000,
-					},
-				},
-				Action: scanFiles,
-			},
-			{
 				Name:  "sync",
 				Usage: "Start synchronization",
 				Flags: []cli.Flag{
@@ -117,6 +97,28 @@ func main() {
 				},
 				Action: showStatus,
 			},
+			{
+				Name:  "import",
+				Usage: "Import file list from CSV",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:     "project",
+						Usage:    "Project name",
+						Required: true,
+					},
+					&cli.StringFlag{
+						Name:     "csv",
+						Usage:    "Path to CSV file",
+						Required: true,
+					},
+					&cli.IntFlag{
+						Name:  "batch",
+						Usage: "Batch size for processing",
+						Value: 1000,
+					},
+				},
+				Action: importCSV,
+			},
 		},
 	}
 
@@ -125,6 +127,18 @@ func main() {
 	}
 }
 
+// createProject creates a new project configuration in the database.
+//
+// It takes the following flags from the cli context:
+// - name: the name of the project
+// - source: the local path to the source files
+// - endpoint: the endpoint URL of the Minio server
+// - bucket: the name of the bucket to store the files
+// - folder: the subfolder within the bucket to store the files
+// - access-key: the access key to use for authentication
+// - secret-key: the secret key to use for authentication
+//
+// If the project is created successfully, it prints a success message to stdout.
 func createProject(c *cli.Context) error {
 	projectName := c.String("name")
 
@@ -155,37 +169,6 @@ func createProject(c *cli.Context) error {
 	}
 
 	fmt.Printf("Project '%s' created successfully\n", projectName)
-	return nil
-}
-
-func scanFiles(c *cli.Context) error {
-	projectName := c.String("project")
-	if projectName == "" {
-		return fmt.Errorf("project name is required")
-	}
-
-	db, err := db.New(projectName)
-	if err != nil {
-		return fmt.Errorf("failed to open database: %v", err)
-	}
-	defer db.Close()
-
-	project, err := db.GetProject(projectName)
-	if err != nil {
-		return fmt.Errorf("failed to get project: %v", err)
-	}
-
-	scannerConfig := sync.ScannerConfig{
-		NumWorkers: c.Int("workers"),
-		BatchSize:  c.Int("batch"),
-	}
-
-	scanner := sync.NewScanner(db, project, &scannerConfig)
-	if err := scanner.ScanFiles(); err != nil {
-		return fmt.Errorf("failed to scan files: %v", err)
-	}
-
-	fmt.Println("Scan completed successfully")
 	return nil
 }
 
@@ -224,6 +207,9 @@ func startSync(c *cli.Context) error {
 	return nil
 }
 
+// showStatus shows the status of the project
+//
+// It will show the number of total files, files uploaded, files pending, and the progress of the sync process.
 func showStatus(c *cli.Context) error {
 	projectName := c.String("project")
 	if projectName == "" {
@@ -257,5 +243,180 @@ func showStatus(c *cli.Context) error {
 	sizeProgress := float64(stats.UploadedSize) / float64(stats.TotalSize) * 100
 	fmt.Printf("Progress: %.2f%% (Files), %.2f%% (Size)\n", fileProgress, sizeProgress)
 
+	return nil
+}
+
+// importCSV imports file records from a CSV file to the database
+//
+// The CSV file must contain the following columns:
+//
+// - id_upload
+// - path
+// - nama_modul
+// - file_type
+// - nama_file_asli
+// - id_profile
+// - id
+// - str_key
+// - str_subkey
+//
+// The CSV file may contain additional columns, which will be ignored.
+//
+// The function processes the CSV file in batches of batchSize records.
+// When the batch size is reached, the batch is saved to the database.
+// The function prints a message every time a batch is saved, indicating
+// the number of records processed so far.
+//
+// The function returns an error if the project does not exist, if the
+// CSV file is malformed, or if there is an error saving the records to
+// the database.
+func importCSV(c *cli.Context) error {
+	projectName := c.String("project")
+	csvPath := c.String("csv")
+	batchSize := c.Int("batch")
+
+	// Open database connection
+	db, err := db.New(projectName)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Check if project exists and get source path
+	project, err := db.GetProject(projectName)
+	if err != nil {
+		return fmt.Errorf("project not found: %v", err)
+	}
+
+	// Open and read CSV file
+	file, err := os.Open(csvPath)
+	if err != nil {
+		return fmt.Errorf("failed to open CSV file: %v", err)
+	}
+	defer file.Close()
+
+	// Create CSV reader
+	reader := csv.NewReader(file)
+	reader.Comma = ','
+
+	// Read header
+	header, err := reader.Read()
+	if err != nil {
+		return fmt.Errorf("failed to read CSV header: %v", err)
+	}
+
+	// Map header indices
+	headerMap := make(map[string]int)
+	for i, h := range header {
+		headerMap[strings.TrimSpace(strings.ToLower(h))] = i
+	}
+
+	// Required fields
+	requiredFields := []string{
+		"id_upload", "path", "nama_modul", "file_type",
+		"nama_file_asli", "id_profile", "id", "str_key", "str_subkey",
+	}
+
+	// Verify required fields
+	for _, field := range requiredFields {
+		if _, ok := headerMap[field]; !ok {
+			return fmt.Errorf("required field '%s' not found in CSV", field)
+		}
+	}
+
+	// Process records in batches
+	var records []models.CSVRecord
+	recordCount := 0
+	skippedCount := 0
+	var totalSize int64
+
+	// Get existing files to track updates
+	existingFiles, err := db.GetProjectFiles(projectName)
+	if err != nil {
+		return fmt.Errorf("failed to get existing files: %v", err)
+	}
+	existingFilesMap := make(map[string]bool)
+	for _, f := range existingFiles {
+		existingFilesMap[f.FilePath] = true
+	}
+	updatedCount := 0
+
+	fmt.Println("Starting import process...")
+	fmt.Println("Checking files and collecting sizes...")
+
+	for {
+		row, err := reader.Read()
+		if err == io.EOF {
+			if len(records) > 0 {
+				if err := db.SaveFileRecordsFromCSVBatch(projectName, records); err != nil {
+					return fmt.Errorf("failed to save batch: %v", err)
+				}
+			}
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read CSV row: %v", err)
+		}
+
+		filePath := row[headerMap["path"]]
+		fullPath := filepath.Join(project.SourcePath, filePath)
+
+		// Check if file exists and get its info
+		fileInfo, err := os.Stat(fullPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				skippedCount++
+				fmt.Printf("\rSkipped non-existent file: %s", filePath)
+				continue
+			}
+			return fmt.Errorf("failed to get file info for %s: %v", filePath, err)
+		}
+
+		// Skip directories
+		if fileInfo.IsDir() {
+			skippedCount++
+			continue
+		}
+
+		record := models.CSVRecord{
+			IDUpload:     row[headerMap["id_upload"]],
+			Path:         filePath,
+			NamaModul:    row[headerMap["nama_modul"]],
+			FileType:     row[headerMap["file_type"]],
+			NamaFileAsli: row[headerMap["nama_file_asli"]],
+			IDProfile:    row[headerMap["id_profile"]],
+			ID:           row[headerMap["id"]],
+			StrKey:       row[headerMap["str_key"]],
+			StrSubKey:    row[headerMap["str_subkey"]],
+			Size:         fileInfo.Size(),
+		}
+
+		records = append(records, record)
+		if existingFilesMap[filePath] {
+			updatedCount++
+		} else {
+			recordCount++
+		}
+		totalSize += fileInfo.Size()
+
+		if len(records) >= batchSize {
+			if err := db.SaveFileRecordsFromCSVBatch(projectName, records); err != nil {
+				return fmt.Errorf("failed to save batch: %v", err)
+			}
+			records = records[:0]
+			fmt.Printf("\rProcessed %d new files, updated %d files (%s), skipped %d files", 
+				recordCount,
+				updatedCount,
+				utils.FormatSize(totalSize),
+				skippedCount,
+			)
+		}
+	}
+
+	fmt.Printf("\nImport completed:\n")
+	fmt.Printf("- New files imported: %d\n", recordCount)
+	fmt.Printf("- Existing files updated: %d\n", updatedCount)
+	fmt.Printf("- Total size: %s\n", utils.FormatSize(totalSize))
+	fmt.Printf("- Skipped: %d files\n", skippedCount)
 	return nil
 }

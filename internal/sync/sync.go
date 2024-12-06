@@ -3,7 +3,6 @@ package sync
 import (
 	"context"
 	"fmt"
-	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -17,232 +16,8 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"encoding/json"
 )
-
-// Scanner handles file scanning operations
-type Scanner struct {
-	db         *db.DB
-	project    *models.Project
-	numWorkers int
-	batchSize  int
-}
-
-type scanProgress struct {
-	CurrentFiles   int64
-	TotalSize      int64
-	NewFiles       int64
-	ModifiedFiles  int64
-	RequeueFiles   int64
-	UnchangedFiles int64
-	sync.Mutex
-}
-
-func (p *scanProgress) Update(size int64, isNew, isModified, isRequeue bool) {
-	p.Lock()
-	defer p.Unlock()
-	p.CurrentFiles++
-	p.TotalSize += size
-	if isNew {
-		p.NewFiles++
-	} else if isModified {
-		p.ModifiedFiles++
-	} else if isRequeue {
-		p.RequeueFiles++
-	} else {
-		p.UnchangedFiles++
-	}
-}
-
-func (p *scanProgress) Print() {
-	fmt.Printf("\rScanning: %d files (%s) - New: %d, Modified: %d, Requeued: %d, Unchanged: %d",
-		p.CurrentFiles,
-		utils.FormatSize(p.TotalSize),
-		p.NewFiles,
-		p.ModifiedFiles,
-		p.RequeueFiles,
-		p.UnchangedFiles,
-	)
-}
-
-// ScannerConfig holds configuration for the scanner
-type ScannerConfig struct {
-	NumWorkers int
-	BatchSize  int
-}
-
-// DefaultScannerConfig returns default scanner configuration
-func DefaultScannerConfig() ScannerConfig {
-	return ScannerConfig{
-		NumWorkers: 8,
-		BatchSize:  1000,
-	}
-}
-
-// NewScanner creates a new scanner instance
-func NewScanner(db *db.DB, project *models.Project, config *ScannerConfig) *Scanner {
-	if config == nil {
-		defaultConfig := DefaultScannerConfig()
-		config = &defaultConfig
-	}
-	return &Scanner{
-		db:         db,
-		project:    project,
-		numWorkers: config.NumWorkers,
-		batchSize:  config.BatchSize,
-	}
-}
-
-// ScanFiles scans all files in the project directory using parallel workers
-func (s *Scanner) ScanFiles() error {
-	progress := &scanProgress{}
-	recordChan := make(chan models.FileRecord, s.batchSize*2)
-	errorChan := make(chan error, s.numWorkers)
-	done := make(chan bool)
-
-	// Start the batch processor
-	go s.processBatches(recordChan, errorChan, done)
-
-	// Create a semaphore to limit concurrent goroutines
-	sem := make(chan struct{}, s.numWorkers)
-	var wg sync.WaitGroup
-
-	// Use WalkDir which is more efficient than Walk
-	if err := filepath.WalkDir(s.project.SourcePath, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if !d.IsDir() {
-			wg.Add(1)
-			// Acquire semaphore
-			sem <- struct{}{}
-
-			go func(filePath string, dirEntry fs.DirEntry) {
-				defer wg.Done()
-				defer func() { <-sem }() // Release semaphore
-
-				info, err := dirEntry.Info()
-				if err != nil {
-					errorChan <- fmt.Errorf("failed to get file info for %s: %v", filePath, err)
-					return
-				}
-
-				relPath, err := filepath.Rel(s.project.SourcePath, filePath)
-				if err != nil {
-					errorChan <- fmt.Errorf("failed to get relative path for %s: %v", filePath, err)
-					return
-				}
-
-				// Check if file exists in database
-				existingFile, err := s.db.GetFileByPath(s.project.Name, relPath)
-				if err != nil {
-					errorChan <- fmt.Errorf("failed to check file in database: %v", err)
-					return
-				}
-
-				isNew := existingFile == nil
-				isModified := false
-				isRequeue := false
-				uploadStatus := "pending"
-
-				if !isNew {
-					// Check if file needs to be requeued (exists but not successfully uploaded)
-					if existingFile.UploadStatus != "uploaded" {
-						isRequeue = true
-					} else {
-						// Check if file is modified by comparing timestamps and size
-						isModified = info.ModTime().After(existingFile.Timestamp) || info.Size() != existingFile.Size
-						if !isModified {
-							uploadStatus = existingFile.UploadStatus
-						}
-					}
-				}
-
-				record := models.FileRecord{
-					FilePath:     relPath,
-					Size:         info.Size(),
-					Timestamp:    info.ModTime(),
-					UploadStatus: uploadStatus,
-				}
-
-				progress.Update(info.Size(), isNew, isModified, isRequeue)
-				if progress.CurrentFiles%1000 == 0 {
-					progress.Print()
-				}
-
-				if isNew || isModified || isRequeue {
-					recordChan <- record
-				}
-			}(path, d)
-		}
-		return nil
-	}); err != nil {
-		return fmt.Errorf("walk error: %v", err)
-	}
-
-	// Wait for all workers to complete
-	wg.Wait()
-	close(recordChan)
-
-	// Wait for batch processor to complete
-	select {
-	case err := <-errorChan:
-		return fmt.Errorf("scanning error: %v", err)
-	case <-done:
-		progress.Print()
-		fmt.Printf("\nScan completed: %d total files (%s)\n",
-			progress.CurrentFiles,
-			utils.FormatSize(progress.TotalSize))
-		fmt.Printf("New files: %d\n", progress.NewFiles)
-		fmt.Printf("Modified files: %d\n", progress.ModifiedFiles)
-		fmt.Printf("Requeued files: %d\n", progress.RequeueFiles)
-		fmt.Printf("Unchanged files: %d\n", progress.UnchangedFiles)
-		return nil
-	}
-}
-
-// processBatches handles batch processing of file records
-func (s *Scanner) processBatches(records <-chan models.FileRecord, errorChan chan<- error, done chan<- bool) {
-	var batch []models.FileRecord
-	ticker := time.NewTicker(time.Second * 5) // Flush every 5 seconds if batch is not full
-	defer ticker.Stop()
-
-	for {
-		select {
-		case record, ok := <-records:
-			if !ok {
-				// Channel closed, flush remaining records
-				if len(batch) > 0 {
-					if err := s.db.SaveFileRecordsBatch(s.project.Name, batch); err != nil {
-						errorChan <- fmt.Errorf("failed to save final batch: %v", err)
-						return
-					}
-				}
-				done <- true
-				return
-			}
-
-			batch = append(batch, record)
-			if len(batch) >= s.batchSize {
-				if err := s.db.SaveFileRecordsBatch(s.project.Name, batch); err != nil {
-					errorChan <- fmt.Errorf("failed to save batch: %v", err)
-					return
-				}
-				batch = batch[:0]
-			}
-
-		case <-ticker.C:
-			// Periodic flush of partial batches
-			if len(batch) > 0 {
-				if err := s.db.SaveFileRecordsBatch(s.project.Name, batch); err != nil {
-					errorChan <- fmt.Errorf("failed to save periodic batch: %v", err)
-					return
-				}
-				batch = batch[:0]
-			}
-		}
-	}
-}
 
 // Syncer handles file synchronization operations
 type Syncer struct {
@@ -396,6 +171,7 @@ func (s *Syncer) SyncFiles() error {
 		destinationPath string
 		size            int64
 		isRetry         bool
+		metadata        map[string]string
 	}
 
 	jobs := make(chan workItem, s.numWorkers)
@@ -448,12 +224,18 @@ func (s *Syncer) SyncFiles() error {
 					continue
 				}
 
+				// Set metadata if available
+				var opts minio.PutObjectOptions
+				if job.metadata != nil {
+					opts.UserMetadata = job.metadata
+				}
+
 				_, err := s.minioClient.FPutObject(
 					context.Background(),
 					s.project.Destination.Bucket,
 					job.destinationPath,
 					fullPath,
-					minio.PutObjectOptions{},
+					opts,
 				)
 
 				if err != nil {
@@ -463,6 +245,16 @@ func (s *Syncer) SyncFiles() error {
 						log.Printf("Failed to update status for %s: %v\n", job.filePath, dbErr)
 					}
 					continue
+				}
+
+				// After successful upload, update the metadata in database
+				metadataJSON, err := json.Marshal(job.metadata)
+				if err != nil {
+					log.Printf("\nWarning: Failed to marshal metadata for %s: %v\n", job.filePath, err)
+				} else {
+					if err := s.db.UpdateFileMetadata(s.project.Name, job.filePath, string(metadataJSON)); err != nil {
+						log.Printf("\nWarning: Failed to update metadata for %s: %v\n", job.filePath, err)
+					}
 				}
 
 				completedFiles = append(completedFiles, job.filePath)
@@ -494,12 +286,36 @@ func (s *Syncer) SyncFiles() error {
 
 	// Send jobs to workers
 	for _, file := range files {
-		destinationPath := strings.ReplaceAll(s.project.Destination.Folder+file.FilePath, "\\", "/")
+		// Ensure folder has trailing slash and construct path
+		folder := strings.TrimRight(s.project.Destination.Folder, "/") + "/"
+		destinationPath := fmt.Sprintf("%s%s", folder, file.IDFile)
+
+		// Create complete metadata
+		metadata := map[string]string{
+			"path":          file.FilePath,
+			"nama_modul":    "",  // Will be populated from CSV metadata
+			"nama_file_asli": "", // Will be populated from CSV metadata
+			"id_profile":    "",  // Will be populated from CSV metadata
+			"bucket":        fmt.Sprintf("%s/%s", s.project.Destination.Bucket, destinationPath),
+			"existing_id":   file.IDFromCSV,
+		}
+
+		// Parse existing metadata if available
+		if file.Metadata != "" {
+			var existingMeta map[string]string
+			if err := json.Unmarshal([]byte(file.Metadata), &existingMeta); err == nil {
+				metadata["nama_modul"] = existingMeta["nama_modul"]
+				metadata["nama_file_asli"] = existingMeta["nama_file_asli"]
+				metadata["id_profile"] = existingMeta["id_profile"]
+			}
+		}
+
 		jobs <- workItem{
 			filePath:        file.FilePath,
 			destinationPath: destinationPath,
 			size:           file.Size,
 			isRetry:        file.UploadStatus == "failed",
+			metadata:       metadata,
 		}
 	}
 

@@ -10,6 +10,8 @@ A command-line tool for synchronizing local directories with MinIO object storag
 - Smart file change detection
 - Automatic retry of failed uploads
 - Detailed status reporting
+- CSV-based file import with metadata support
+- Rich metadata handling for uploaded files
 
 ## Project Structure
 
@@ -60,21 +62,28 @@ go build -o msync.exe ./cmd/msync
 msync create --name <project-name> --source <source-dir> --endpoint <minio-endpoint> --bucket <bucket-name> --folder <dest-folder> --access-key <access-key> --secret-key <secret-key>
 ```
 
-### Scan Files
+### Import Files from CSV
 
 ```bash
-msync scan --project <project-name> [--workers <num-workers>] [--batch <batch-size>]
+msync import --project <project-name> --csv <csv-file> [--batch <batch-size>]
 ```
 
-The scan command:
-- Detects new files not in the database
-- Identifies modified files by comparing timestamps and sizes
-- Requeues files that weren't successfully uploaded
-- Shows real-time progress including:
-  - New files count and size
-  - Modified files count and size
-  - Requeued files count and size
-  - Unchanged files count and size
+The import command processes a CSV file containing file information. The CSV must include these columns:
+- `id_upload`: Unique identifier for the upload
+- `path`: Relative path to the file
+- `nama_modul`: Module name
+- `file_type`: Type of file
+- `nama_file_asli`: Original file name
+- `id_profile`: Profile ID
+- `id`: Unique identifier (preserved as existing_id)
+- `str_key`: String key
+- `str_subkey`: String subkey
+
+The command:
+- Validates file existence in the source directory
+- Skips non-existent or directory entries
+- Preserves metadata for successful uploads
+- Shows real-time progress of the import process
 
 ### Sync Files
 
@@ -105,12 +114,31 @@ Files can be in one of the following states:
 - `failed`: Upload attempt failed
 - `skipped`: File no longer exists in source directory
 
+## Metadata Handling
+
+Files uploaded to MinIO include rich metadata that is stored both in MinIO and the local database:
+
+### During Import
+- CSV metadata is temporarily stored
+- File records are created with pending status
+- Original CSV IDs are preserved
+
+### After Upload
+The following metadata is stored for each file:
+- `path`: Original file path
+- `nama_modul`: Module name from CSV
+- `nama_file_asli`: Original file name from CSV
+- `id_profile`: Profile ID from CSV
+- `bucket`: Full bucket path including destination folder
+- `existing_id`: Original ID from CSV
+
+This metadata can be used for tracking, verification, and integration with other systems.
+
 ## Performance Tuning
 
-### Scan Performance
-- Increase `--workers` for faster scanning on systems with good disk I/O
-- Increase `--batch` to reduce database overhead with large file sets
-- Example for large directories: `--workers 16 --batch 5000`
+### Import Performance
+- Adjust `--batch` based on memory availability and CSV size
+- Example for large CSV files: `--batch 5000`
 
 ### Sync Performance
 - Increase `--workers` for faster uploads with good network connection

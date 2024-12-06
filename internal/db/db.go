@@ -2,7 +2,11 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
+
 	"github.com/chmdznr/local-to-minio-copier/pkg/models"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -44,14 +48,26 @@ func (db *DB) initialize() error {
 		);
 		CREATE TABLE IF NOT EXISTS files (
 			project_name TEXT,
+			id_file TEXT,           -- ID from file uploaded to MINIO
+			id_permohonan TEXT,     -- Application ID
+			id_from_csv TEXT,       -- ID field from CSV
 			file_path TEXT,
-			size INTEGER,
+			file_size INTEGER,
+			file_type TEXT,         -- File type uploaded to MINIO
+			bucketpath TEXT,        -- bucket + path
+			f_metadata TEXT,        -- JSON metadata
+			userid TEXT,            -- User ID (migrator)
+			created_at DATETIME,    -- Upload time to MINIO
+			str_key TEXT,           -- Application ID
+			str_subkey TEXT,
 			timestamp DATETIME,
 			upload_status TEXT,
 			PRIMARY KEY (project_name, file_path)
 		);
 		CREATE INDEX IF NOT EXISTS idx_files_status ON files(project_name, upload_status);
 		CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(project_name, timestamp);
+		CREATE INDEX IF NOT EXISTS idx_files_id_file ON files(id_file);
+		CREATE INDEX IF NOT EXISTS idx_files_id_permohonan ON files(id_permohonan);
 		PRAGMA journal_mode=WAL;
 		PRAGMA synchronous=NORMAL;
 		PRAGMA temp_store=MEMORY;
@@ -100,19 +116,26 @@ func (db *DB) CreateProject(project *models.Project) error {
 	return err
 }
 
-// GetPendingFiles retrieves pending and failed files for a project
+// GetPendingFiles returns all files that need to be uploaded
 func (db *DB) GetPendingFiles(projectName string) ([]models.FileRecord, error) {
 	rows, err := db.Query(`
-		SELECT file_path, size, upload_status, timestamp 
-		FROM files 
-		WHERE project_name = ? 
-		AND (upload_status = 'pending' OR upload_status = 'failed')
-		ORDER BY 
-			CASE upload_status
-				WHEN 'failed' THEN 1
-				WHEN 'pending' THEN 2
-			END,
-			size DESC
+		SELECT 
+			file_path,
+			COALESCE(id_file, '') as id_file,
+			COALESCE(id_permohonan, '') as id_permohonan,
+			COALESCE(id_from_csv, '') as id_from_csv,
+			COALESCE(file_size, 0) as file_size,
+			COALESCE(file_type, '') as file_type,
+			COALESCE(bucketpath, '') as bucketpath,
+			COALESCE(f_metadata, '{}') as f_metadata,
+			COALESCE(userid, 'migrator') as userid,
+			COALESCE(created_at, CURRENT_TIMESTAMP) as created_at,
+			COALESCE(str_key, '') as str_key,
+			COALESCE(str_subkey, '') as str_subkey,
+			COALESCE(timestamp, CURRENT_TIMESTAMP) as timestamp,
+			COALESCE(upload_status, 'pending') as upload_status
+		FROM files
+		WHERE project_name = ? AND (upload_status = 'pending' OR upload_status = 'failed')
 	`, projectName)
 	if err != nil {
 		return nil, err
@@ -122,29 +145,87 @@ func (db *DB) GetPendingFiles(projectName string) ([]models.FileRecord, error) {
 	var files []models.FileRecord
 	for rows.Next() {
 		var file models.FileRecord
-		err = rows.Scan(&file.FilePath, &file.Size, &file.UploadStatus, &file.Timestamp)
+		var timestamp string
+		var createdAt string
+		err := rows.Scan(
+			&file.FilePath,
+			&file.IDFile,
+			&file.IDPermohonan,
+			&file.IDFromCSV,
+			&file.Size,
+			&file.FileType,
+			&file.BucketPath,
+			&file.Metadata,
+			&file.UserID,
+			&createdAt,
+			&file.StrKey,
+			&file.StrSubKey,
+			&timestamp,
+			&file.UploadStatus,
+		)
 		if err != nil {
 			return nil, err
 		}
+
+		// Parse timestamps
+		file.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
+		file.Timestamp, _ = time.Parse("2006-01-02 15:04:05", timestamp)
+
 		files = append(files, file)
 	}
-	return files, nil
+	return files, rows.Err()
 }
 
-// UpdateFileStatus updates the status of a file
+// UpdateFileStatus updates the status of a file and its upload-related fields
 func (db *DB) UpdateFileStatus(projectName, filePath, status string) error {
+	now := time.Now()
 	_, err := db.Exec(`
 		UPDATE files 
-		SET upload_status = ? 
+		SET 
+			upload_status = ?,
+			timestamp = ?,
+			created_at = ?
 		WHERE project_name = ? AND file_path = ?
-	`, status, projectName, filePath)
+	`, status, now, now, projectName, filePath)
 	return err
+}
+
+// UpdateFileStatusBatch updates the status of multiple files in a batch
+func (db *DB) UpdateFileStatusBatch(projectName string, filePaths []string, status string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	now := time.Now()
+	stmt, err := tx.Prepare(`
+		UPDATE files 
+		SET 
+			upload_status = ?,
+			timestamp = ?,
+			created_at = ?
+		WHERE project_name = ? AND file_path = ?
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, filePath := range filePaths {
+		_, err = stmt.Exec(status, now, now, projectName, filePath)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
 }
 
 // SaveFileRecord saves a file record
 func (db *DB) SaveFileRecord(projectName string, record *models.FileRecord) error {
 	_, err := db.Exec(`
-		INSERT OR REPLACE INTO files (project_name, file_path, size, timestamp, upload_status)
+		INSERT OR REPLACE INTO files (project_name, file_path, file_size, timestamp, upload_status)
 		VALUES (?, ?, ?, ?, ?)
 	`, projectName, record.FilePath, record.Size, record.Timestamp, record.UploadStatus)
 	return err
@@ -159,7 +240,7 @@ func (db *DB) SaveFileRecordsBatch(projectName string, records []models.FileReco
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT OR REPLACE INTO files (project_name, file_path, size, timestamp, upload_status)
+		INSERT OR REPLACE INTO files (project_name, file_path, file_size, timestamp, upload_status)
 		VALUES (?, ?, ?, ?, ?)
 	`)
 	if err != nil {
@@ -183,57 +264,29 @@ func (db *DB) SaveFileRecordsBatch(projectName string, records []models.FileReco
 	return tx.Commit()
 }
 
-// UpdateFileStatusBatch updates the status of multiple files in a single transaction
-func (db *DB) UpdateFileStatusBatch(projectName string, filePaths []string, status string) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.Prepare(`
-		UPDATE files 
-		SET upload_status = ? 
-		WHERE project_name = ? AND file_path = ?
-	`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
-	for _, filePath := range filePaths {
-		_, err = stmt.Exec(status, projectName, filePath)
-		if err != nil {
-			return err
-		}
-	}
-
-	return tx.Commit()
-}
-
 // GetFileStats returns statistics about files in the project
 func (db *DB) GetFileStats(projectName string) (totalFiles, totalSize, uploadedFiles, uploadedSize int64, err error) {
 	// Get total files and size
 	err = db.QueryRow(`
-		SELECT COUNT(*), COALESCE(SUM(size), 0)
+		SELECT COUNT(*), COALESCE(SUM(file_size), 0)
 		FROM files
 		WHERE project_name = ?
 	`, projectName).Scan(&totalFiles, &totalSize)
 	if err != nil {
-		return
+		return 0, 0, 0, 0, err
 	}
 
 	// Get uploaded files and size
 	err = db.QueryRow(`
-		SELECT COUNT(*), COALESCE(SUM(size), 0)
+		SELECT COUNT(*), COALESCE(SUM(file_size), 0)
 		FROM files
 		WHERE project_name = ? AND upload_status = 'uploaded'
 	`, projectName).Scan(&uploadedFiles, &uploadedSize)
 	if err != nil {
-		return
+		return 0, 0, 0, 0, err
 	}
 
-	return
+	return totalFiles, totalSize, uploadedFiles, uploadedSize, nil
 }
 
 // GetStats returns statistics about files in the project
@@ -242,11 +295,11 @@ func (db *DB) GetStats(projectName string) (*models.Stats, error) {
 	err := db.QueryRow(`
 		SELECT 
 			COUNT(*) as total_files,
-			COALESCE(SUM(size), 0) as total_size,
+			COALESCE(SUM(file_size), 0) as total_size,
 			COUNT(CASE WHEN upload_status = 'uploaded' THEN 1 END) as uploaded_files,
-			COALESCE(SUM(CASE WHEN upload_status = 'uploaded' THEN size ELSE 0 END), 0) as uploaded_size,
+			COALESCE(SUM(CASE WHEN upload_status = 'uploaded' THEN file_size ELSE 0 END), 0) as uploaded_size,
 			COUNT(CASE WHEN upload_status = 'pending' THEN 1 END) as pending_files,
-			COALESCE(SUM(CASE WHEN upload_status = 'pending' THEN size ELSE 0 END), 0) as pending_size
+			COALESCE(SUM(CASE WHEN upload_status = 'pending' THEN file_size ELSE 0 END), 0) as pending_size
 		FROM files 
 		WHERE project_name = ?
 	`, projectName).Scan(
@@ -267,15 +320,194 @@ func (db *DB) GetStats(projectName string) (*models.Stats, error) {
 func (db *DB) GetFileByPath(projectName string, filePath string) (*models.FileRecord, error) {
 	var record models.FileRecord
 	err := db.QueryRow(
-		"SELECT file_path, size, timestamp, upload_status FROM files WHERE project_name = ? AND file_path = ?",
+		"SELECT file_path, file_size, timestamp, upload_status FROM files WHERE project_name = ? AND file_path = ?",
 		projectName, filePath,
 	).Scan(&record.FilePath, &record.Size, &record.Timestamp, &record.UploadStatus)
 
 	if err == sql.ErrNoRows {
 		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("error getting file record: %v", err)
+	} else if err != nil {
+		return nil, err
 	}
 	return &record, nil
+}
+
+// SaveFileRecordFromCSV saves a file record from CSV data
+func (db *DB) SaveFileRecordFromCSV(projectName string, csvRecord *models.CSVRecord) error {
+	metadata := models.FileMetadata{
+		Path:         csvRecord.Path,
+		NamaModul:    csvRecord.NamaModul,
+		NamaFileAsli: csvRecord.NamaFileAsli,
+		IDProfile:    csvRecord.IDProfile,
+		ExistingID:   csvRecord.ID,
+	}
+
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`
+		INSERT INTO files (
+			project_name, id_file, id_permohonan, id_from_csv, file_path, file_type,
+			bucketpath, f_metadata, userid, created_at, str_key,
+			str_subkey, timestamp, upload_status
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(project_name, file_path) DO UPDATE SET
+			id_file = excluded.id_file,
+			id_permohonan = excluded.id_permohonan,
+			id_from_csv = excluded.id_from_csv,
+			file_type = excluded.file_type,
+			bucketpath = excluded.bucketpath,
+			f_metadata = excluded.f_metadata,
+			userid = excluded.userid,
+			created_at = excluded.created_at,
+			str_key = excluded.str_key,
+			str_subkey = excluded.str_subkey,
+			timestamp = excluded.timestamp,
+			upload_status = excluded.upload_status
+	`,
+		projectName,
+		csvRecord.IDUpload,   // id_file
+		csvRecord.StrKey,     // id_permohonan
+		csvRecord.ID,         // id_from_csv
+		csvRecord.Path,       // file_path
+		csvRecord.FileType,   // file_type
+		"",                   // bucketpath (to be set during upload)
+		string(metadataJSON), // f_metadata
+		"migrator",           // userid
+		time.Now(),           // created_at
+		csvRecord.StrKey,     // str_key
+		csvRecord.StrSubKey,  // str_subkey
+		time.Now(),           // timestamp
+		"pending",            // upload_status
+	)
+
+	return err
+}
+
+// SaveFileRecordsFromCSVBatch saves multiple file records from CSV data in a single transaction
+func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.CSVRecord) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Get project details for bucket path
+	var folder string
+	err = tx.QueryRow("SELECT folder FROM projects WHERE name = ?", projectName).Scan(&folder)
+	if err != nil {
+		return fmt.Errorf("failed to get project details: %v", err)
+	}
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO files (
+			project_name, file_path, id_file, id_permohonan, id_from_csv,
+			file_size, file_type, bucketpath, f_metadata,
+			userid, created_at, str_key, str_subkey, upload_status
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+		ON CONFLICT(project_name, file_path) DO UPDATE SET
+			id_file = excluded.id_file,
+			id_permohonan = excluded.id_permohonan,
+			id_from_csv = excluded.id_from_csv,
+			file_size = excluded.file_size,
+			file_type = excluded.file_type,
+			bucketpath = excluded.bucketpath,
+			f_metadata = excluded.f_metadata,
+			userid = excluded.userid,
+			created_at = excluded.created_at,
+			str_key = excluded.str_key,
+			str_subkey = excluded.str_subkey,
+			upload_status = 'pending'
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	now := time.Now()
+
+	for _, record := range records {
+		metadata := map[string]string{
+			"nama_modul":     record.NamaModul,
+			"nama_file_asli": record.NamaFileAsli,
+			"id_profile":     record.IDProfile,
+		}
+		metadataJSON, err := json.Marshal(metadata)
+		if err != nil {
+			return err
+		}
+
+		// Ensure folder has trailing slash
+		folder = strings.TrimRight(folder, "/") + "/"
+		bucketPath := fmt.Sprintf("%s%s", folder, record.IDUpload)
+
+		// Convert empty strings to valid values
+		idFromCSV := record.ID
+		if idFromCSV == "" {
+			idFromCSV = "0"
+		}
+
+		_, err = stmt.Exec(
+			projectName,
+			record.Path,
+			record.IDUpload,
+			record.ID,
+			idFromCSV, // id_from_csv
+			record.Size,
+			record.FileType,
+			bucketPath,
+			string(metadataJSON),
+			"migrator",
+			now,
+			record.StrKey,
+			record.StrSubKey,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// GetProjectFiles returns all files for a given project
+func (db *DB) GetProjectFiles(projectName string) ([]models.FileRecord, error) {
+	rows, err := db.Query(`
+		SELECT 
+			file_path, 
+			COALESCE(file_size, 0) as file_size,
+			COALESCE(file_type, '') as file_type,
+			COALESCE(bucketpath, '') as bucketpath,
+			COALESCE(f_metadata, '{}') as f_metadata
+		FROM files
+		WHERE project_name = ?
+	`, projectName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var files []models.FileRecord
+	for rows.Next() {
+		var file models.FileRecord
+		var metadataStr string
+		err := rows.Scan(&file.FilePath, &file.Size, &file.FileType, &file.BucketPath, &metadataStr)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, file)
+	}
+	return files, rows.Err()
+}
+
+// UpdateFileMetadata updates the metadata of a file
+func (db *DB) UpdateFileMetadata(projectName, filePath, metadata string) error {
+	_, err := db.Exec(`
+		UPDATE files 
+		SET f_metadata = ?
+		WHERE project_name = ? AND file_path = ?
+	`, metadata, projectName, filePath)
+	return err
 }
