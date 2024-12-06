@@ -306,16 +306,10 @@ func importCSV(c *cli.Context) error {
 	}
 	defer db.Close()
 
-	// Check if project exists and get source path
-	project, err := db.GetProject(projectName)
-	if err != nil {
-		return fmt.Errorf("project not found: %v", err)
-	}
-
-	// Open and read CSV file
+	// Open CSV file
 	file, err := os.Open(csvPath)
 	if err != nil {
-		return fmt.Errorf("failed to open CSV file: %v", err)
+		return fmt.Errorf("error opening CSV file: %v", err)
 	}
 	defer file.Close()
 
@@ -351,7 +345,6 @@ func importCSV(c *cli.Context) error {
 		
 		// Check if file exists
 		if _, err := os.Stat(filePath); os.IsNotExist(err) {
-			log.Printf("Warning: File not found at line %d: %s", lineNum, filePath)
 			if err := db.AddMissingFile(filePath, lineNum); err != nil {
 				log.Printf("Error recording missing file: %v", err)
 			}
@@ -366,27 +359,9 @@ func importCSV(c *cli.Context) error {
 		processed++
 	}
 
-	// Get final count of missing files
-	missingCount, err := db.GetMissingFilesCount()
-	if err != nil {
-		log.Printf("Error getting missing files count: %v", err)
-	}
-
 	fmt.Printf("\nImport Summary:\n")
 	fmt.Printf("- Successfully processed: %d files\n", processed)
-	fmt.Printf("- Missing files: %d\n", missingCount)
-
-	if missingCount > 0 {
-		fmt.Printf("\nMissing Files Details:\n")
-		missingFiles, err := db.GetMissingFiles()
-		if err != nil {
-			log.Printf("Error retrieving missing files list: %v", err)
-		} else {
-			for _, f := range missingFiles {
-				fmt.Printf("Line %d: %s\n", f.CSVLine, f.FilePath)
-			}
-		}
-	}
+	fmt.Printf("- Missing files: %d\n", missing)
 
 	return nil
 }

@@ -518,6 +518,14 @@ func (db *DB) UpdateFileMetadata(projectName, filePath, metadata string) error {
 	return err
 }
 
+// AddFileFromCSV adds a file record from CSV data
+func (db *DB) AddFileFromCSV(projectName, idFile, idPermohonan, timestamp, filePath string) error {
+	query := `INSERT INTO files (project_name, id_file, id_permohonan, timestamp, filepath, status) 
+              VALUES (?, ?, ?, ?, ?, 'pending')`
+	_, err := db.Exec(query, projectName, idFile, idPermohonan, timestamp, filePath)
+	return err
+}
+
 // MissingFile represents a file that was in the CSV but not found on disk
 type MissingFile struct {
 	ID        int64
