@@ -9,10 +9,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/chmdznr/local-to-minio-copier/internal/db"
-	"github.com/chmdznr/local-to-minio-copier/internal/sync"
-	"github.com/chmdznr/local-to-minio-copier/pkg/models"
-	"github.com/chmdznr/local-to-minio-copier/pkg/utils"
+	"github.com/chmdznr/oss-local-to-minio-copier/internal/db"
+	"github.com/chmdznr/oss-local-to-minio-copier/internal/sync"
+	"github.com/chmdznr/oss-local-to-minio-copier/pkg/models"
+	"github.com/chmdznr/oss-local-to-minio-copier/pkg/utils"
 	"github.com/urfave/cli/v2"
 )
 

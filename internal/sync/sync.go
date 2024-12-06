@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/chmdznr/local-to-minio-copier/internal/db"
-	"github.com/chmdznr/local-to-minio-copier/pkg/models"
-	"github.com/chmdznr/local-to-minio-copier/pkg/utils"
+	"github.com/chmdznr/oss-local-to-minio-copier/internal/db"
+	"github.com/chmdznr/oss-local-to-minio-copier/pkg/models"
+	"github.com/chmdznr/oss-local-to-minio-copier/pkg/utils"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"

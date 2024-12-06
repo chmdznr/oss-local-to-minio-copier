@@ -1,4 +1,4 @@
-module github.com/chmdznr/local-to-minio-copier
+module github.com/chmdznr/oss-local-to-minio-copier
 
 go 1.23
 

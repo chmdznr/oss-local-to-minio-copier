@@ -7,8 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chmdznr/local-to-minio-copier/pkg/models"
-
+	"github.com/chmdznr/oss-local-to-minio-copier/pkg/models"
 	_ "github.com/mattn/go-sqlite3"
 )
 
