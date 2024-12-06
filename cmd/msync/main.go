@@ -258,8 +258,13 @@ func showStatus(c *cli.Context) error {
 	fmt.Printf("Files Uploaded: %d (Size: %s)\n", stats.UploadedFiles, utils.FormatSize(stats.UploadedSize))
 	fmt.Printf("Files Pending: %d (Size: %s)\n", stats.PendingFiles, utils.FormatSize(stats.PendingSize))
 
-	fileProgress := float64(stats.UploadedFiles) / float64(stats.TotalFiles) * 100
-	sizeProgress := float64(stats.UploadedSize) / float64(stats.TotalSize) * 100
+	var fileProgress, sizeProgress float64
+	if stats.TotalFiles > 0 {
+		fileProgress = float64(stats.UploadedFiles) / float64(stats.TotalFiles) * 100
+	}
+	if stats.TotalSize > 0 {
+		sizeProgress = float64(stats.UploadedSize) / float64(stats.TotalSize) * 100
+	}
 	fmt.Printf("Progress: %.2f%% (Files), %.2f%% (Size)\n", fileProgress, sizeProgress)
 
 	return nil
