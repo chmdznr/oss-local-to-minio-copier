@@ -67,6 +67,13 @@ func (db *DB) initialize() error {
 		CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(project_name, timestamp);
 		CREATE INDEX IF NOT EXISTS idx_files_id_file ON files(id_file);
 		CREATE INDEX IF NOT EXISTS idx_files_id_permohonan ON files(id_permohonan);
+		CREATE TABLE IF NOT EXISTS missing_files (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			filepath TEXT NOT NULL,
+			csv_line INTEGER,
+			reported_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_missing_files_filepath ON missing_files(filepath);
 		PRAGMA journal_mode=WAL;
 		PRAGMA synchronous=NORMAL;
 		PRAGMA temp_store=MEMORY;
@@ -509,4 +516,47 @@ func (db *DB) UpdateFileMetadata(projectName, filePath, metadata string) error {
 		WHERE project_name = ? AND file_path = ?
 	`, metadata, projectName, filePath)
 	return err
+}
+
+// MissingFile represents a file that was in the CSV but not found on disk
+type MissingFile struct {
+	ID        int64
+	FilePath  string
+	CSVLine   int
+	ReportedAt time.Time
+}
+
+// AddMissingFile adds a record of a missing file
+func (db *DB) AddMissingFile(filePath string, csvLine int) error {
+	query := `INSERT INTO missing_files (filepath, csv_line) VALUES (?, ?)`
+	_, err := db.Exec(query, filePath, csvLine)
+	return err
+}
+
+// GetMissingFilesCount returns the total number of missing files
+func (db *DB) GetMissingFilesCount() (int, error) {
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM missing_files").Scan(&count)
+	return count, err
+}
+
+// GetMissingFiles returns all missing files
+func (db *DB) GetMissingFiles() ([]MissingFile, error) {
+	query := `SELECT id, filepath, csv_line, reported_at FROM missing_files ORDER BY csv_line`
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var files []MissingFile
+	for rows.Next() {
+		var f MissingFile
+		err := rows.Scan(&f.ID, &f.FilePath, &f.CSVLine, &f.ReportedAt)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, f)
+	}
+	return files, rows.Err()
 }
