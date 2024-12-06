@@ -30,6 +30,23 @@ local-to-minio-copier/
 
 - Go 1.16 or later
 - MinIO server access (endpoint, access key, and secret key)
+- GCC or equivalent C compiler (required for SQLite support)
+  - Windows: MinGW-w64 or MSYS2
+  - Linux (RHEL/CentOS): `gcc` and `sqlite-devel`
+    ```bash
+    # RHEL/CentOS
+    sudo dnf install gcc sqlite-devel
+    # or
+    sudo yum install gcc sqlite-devel
+    ```
+  - Linux (Ubuntu/Debian):
+    ```bash
+    sudo apt-get install gcc libsqlite3-dev
+    ```
+  - macOS:
+    ```bash
+    xcode-select --install
+    ```
 
 ## Installation
 
