@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/models"
@@ -45,16 +44,26 @@ func (db *DB) initialize() error {
 			access_key TEXT,
 			secret_key TEXT
 		);
+
 		CREATE TABLE IF NOT EXISTS files (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			project_name TEXT NOT NULL,
 			id_file TEXT,
 			id_permohonan TEXT,
-			timestamp TEXT,
+			id_from_csv TEXT,
 			filepath TEXT NOT NULL,
-			status TEXT DEFAULT 'pending',
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			file_size INTEGER,
+			file_type TEXT,
+			bucketpath TEXT,
+			f_metadata TEXT,
+			userid TEXT DEFAULT 'migrator',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			str_key TEXT,
+			str_subkey TEXT,
+			timestamp TEXT,
+			status TEXT DEFAULT 'pending'
 		);
+
 		DROP TABLE IF EXISTS missing_files;
 		CREATE TABLE IF NOT EXISTS missing_files (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,14 +72,13 @@ func (db *DB) initialize() error {
 			csv_line INTEGER,
 			reported_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
+
 		CREATE INDEX IF NOT EXISTS idx_files_project_name ON files(project_name);
 		CREATE INDEX IF NOT EXISTS idx_files_filepath ON files(filepath);
+		CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
 		CREATE INDEX IF NOT EXISTS idx_missing_files_filepath ON missing_files(filepath);
 		CREATE INDEX IF NOT EXISTS idx_missing_files_id_upload ON missing_files(id_upload);
-		CREATE INDEX IF NOT EXISTS idx_files_status ON files(project_name, status);
-		CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(project_name, timestamp);
-		CREATE INDEX IF NOT EXISTS idx_files_id_file ON files(id_file);
-		CREATE INDEX IF NOT EXISTS idx_files_id_permohonan ON files(id_permohonan);
+
 		PRAGMA journal_mode=WAL;
 		PRAGMA synchronous=NORMAL;
 		PRAGMA temp_store=MEMORY;
@@ -372,30 +380,26 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 	}
 	defer tx.Rollback()
 
-	// Get project details for bucket path
-	var folder string
-	err = tx.QueryRow("SELECT folder FROM projects WHERE name = ?", projectName).Scan(&folder)
-	if err != nil {
-		return fmt.Errorf("failed to get project details: %v", err)
-	}
-
 	stmt, err := tx.Prepare(`
 		INSERT INTO files (
-			project_name, filepath, id_file, id_permohonan, timestamp, status,
-			bucketpath, f_metadata, userid, created_at, str_key,
-			str_subkey
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			project_name, id_file, id_permohonan, id_from_csv,
+			filepath, file_size, file_type, bucketpath, f_metadata,
+			userid, created_at, str_key, str_subkey, timestamp, status
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(project_name, filepath) DO UPDATE SET
 			id_file = excluded.id_file,
 			id_permohonan = excluded.id_permohonan,
-			timestamp = excluded.timestamp,
-			status = excluded.status,
+			id_from_csv = excluded.id_from_csv,
+			file_size = excluded.file_size,
+			file_type = excluded.file_type,
 			bucketpath = excluded.bucketpath,
 			f_metadata = excluded.f_metadata,
 			userid = excluded.userid,
 			created_at = excluded.created_at,
 			str_key = excluded.str_key,
-			str_subkey = excluded.str_subkey
+			str_subkey = excluded.str_subkey,
+			timestamp = excluded.timestamp,
+			status = excluded.status
 	`)
 	if err != nil {
 		return err
@@ -403,41 +407,33 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 	defer stmt.Close()
 
 	now := time.Now()
-
 	for _, record := range records {
-		metadata := map[string]string{
+		metadataJSON, err := json.Marshal(map[string]interface{}{
+			"id_upload":      record.IDUpload,
 			"nama_modul":     record.NamaModul,
 			"nama_file_asli": record.NamaFileAsli,
 			"id_profile":     record.IDProfile,
-		}
-		metadataJSON, err := json.Marshal(metadata)
+		})
 		if err != nil {
-			return err
-		}
-
-		// Ensure folder has trailing slash
-		folder = strings.TrimRight(folder, "/") + "/"
-		bucketPath := fmt.Sprintf("%s%s", folder, record.IDUpload)
-
-		// Convert empty strings to valid values
-		idFromCSV := record.ID
-		if idFromCSV == "" {
-			idFromCSV = "0"
+			return fmt.Errorf("failed to marshal metadata: %v", err)
 		}
 
 		_, err = stmt.Exec(
 			projectName,
-			record.Path,
-			record.IDUpload,
-			record.ID,
-			now,
-			"pending",
-			bucketPath,
-			string(metadataJSON),
-			"migrator",
-			now,
-			record.StrKey,
-			record.StrSubKey,
+			record.IDUpload,    // id_file
+			record.ID,          // id_permohonan
+			record.ID,          // id_from_csv
+			record.Path,        // filepath
+			record.Size,        // file_size
+			record.FileType,    // file_type
+			"",                 // bucketpath (to be set during upload)
+			string(metadataJSON), // f_metadata
+			"migrator",         // userid
+			now,               // created_at
+			record.StrKey,     // str_key
+			record.StrSubKey,  // str_subkey
+			now,               // timestamp
+			"pending",         // status
 		)
 		if err != nil {
 			return err
