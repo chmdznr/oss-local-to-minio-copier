@@ -2,21 +2,26 @@ package sync
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"mime"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/chmdznr/oss-local-to-minio-copier/internal/db"
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/models"
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/utils"
-
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	"encoding/json"
 )
 
 // Syncer handles file synchronization operations
@@ -49,13 +54,34 @@ func NewSyncer(db *db.DB, project *models.Project, config *SyncerConfig) (*Synce
 		config = &defaultConfig
 	}
 
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			// For Google Cloud Storage and similar services
+			MinVersion: tls.VersionTLS12,
+		},
+		// Add timeouts
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	// Create MinIO client with custom transport
 	minioClient, err := minio.New(project.Destination.Endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(project.Destination.AccessKey, project.Destination.SecretKey, ""),
-		Secure: true,
+		Creds:     credentials.NewStaticV4(project.Destination.AccessKey, project.Destination.SecretKey, ""),
+		Secure:    true,
+		Transport: tr,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize MinIO client: %v", err)
 	}
+
+	// Enable request/response debugging if needed
+	minioClient.TraceOn(os.Stdout)
 
 	return &Syncer{
 		db:          db,
@@ -163,7 +189,116 @@ func (p *syncProgress) Print() {
 	)
 }
 
-// SyncFiles synchronizes pending files using a worker pool
+func (s *Syncer) uploadFile(ctx context.Context, file *models.File) error {
+	// Sanitize the destination path
+	destPath := sanitizePath(file.DestPath)
+	
+	// Open the file
+	fileReader, err := os.Open(file.LocalPath)
+	if err != nil {
+		return fmt.Errorf("failed to open file %s: %v", file.LocalPath, err)
+	}
+	defer fileReader.Close()
+
+	// Get file info for content type detection
+	fileInfo, err := fileReader.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file info for %s: %v", file.LocalPath, err)
+	}
+
+	// Detect content type
+	contentType := mime.TypeByExtension(filepath.Ext(file.LocalPath))
+	if contentType == "" {
+		// If no extension match, try to detect from content
+		buffer := make([]byte, 512)
+		_, err = fileReader.Read(buffer)
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("failed to read file content for type detection: %v", err)
+		}
+		contentType = http.DetectContentType(buffer)
+		// Reset the reader to the beginning
+		_, err = fileReader.Seek(0, 0)
+		if err != nil {
+			return fmt.Errorf("failed to reset file reader: %v", err)
+		}
+	}
+
+	// Sanitize metadata
+	sanitizedMetadata := make(map[string]string)
+	for k, v := range file.Metadata {
+		// Remove non-printable characters and normalize spaces
+		sanitizedValue := strings.Map(func(r rune) rune {
+			if unicode.IsPrint(r) {
+				return r
+			}
+			return -1
+		}, v)
+		sanitizedValue = strings.TrimSpace(sanitizedValue)
+		if sanitizedValue != "" {
+			sanitizedMetadata[k] = sanitizedValue
+		}
+	}
+
+	// Prepare upload options
+	opts := minio.PutObjectOptions{
+		ContentType:  contentType,
+		UserMetadata: sanitizedMetadata,
+	}
+
+	// Attempt the upload with retry logic
+	maxRetries := 3
+	var uploadErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		_, uploadErr = s.minioClient.PutObject(
+			ctx,
+			s.project.Destination.Bucket,
+			destPath,
+			fileReader,
+			fileInfo.Size(),
+			opts,
+		)
+
+		if uploadErr == nil {
+			break
+		}
+
+		// Log detailed error information
+		log.Printf("Upload attempt %d failed for file %s: %v", attempt, file.LocalPath, uploadErr)
+
+		// Check if error is retriable
+		if minioErr, ok := uploadErr.(minio.ErrorResponse); ok {
+			log.Printf("MinIO Error Details - Code: %s, Message: %s, RequestID: %s", 
+				minioErr.Code, minioErr.Message, minioErr.RequestID)
+			
+			// Handle specific error cases
+			switch minioErr.Code {
+			case "AccessDenied":
+				return fmt.Errorf("access denied to bucket %s: %v", s.project.Destination.Bucket, uploadErr)
+			case "NoSuchBucket":
+				return fmt.Errorf("bucket %s does not exist: %v", s.project.Destination.Bucket, uploadErr)
+			case "InvalidAccessKeyId":
+				return fmt.Errorf("invalid access key: %v", uploadErr)
+			}
+		}
+
+		// Reset file pointer for retry
+		if attempt < maxRetries {
+			_, err = fileReader.Seek(0, 0)
+			if err != nil {
+				return fmt.Errorf("failed to reset file for retry: %v", err)
+			}
+			// Wait before retrying
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+	}
+
+	if uploadErr != nil {
+		return fmt.Errorf("failed to upload file %s after %d attempts: %v", file.LocalPath, maxRetries, uploadErr)
+	}
+
+	return nil
+}
+
 func (s *Syncer) SyncFiles() error {
 	// Create worker pool
 	type workItem struct {
@@ -227,7 +362,36 @@ func (s *Syncer) SyncFiles() error {
 				// Set metadata if available
 				var opts minio.PutObjectOptions
 				if job.metadata != nil {
-					opts.UserMetadata = job.metadata
+					// Sanitize metadata values
+					sanitizedMetadata := make(map[string]string)
+					for k, v := range job.metadata {
+						// Remove any non-printable characters and normalize spaces
+						sanitized := strings.Map(func(r rune) rune {
+							if r < 32 || r == 127 { // control characters
+								return -1
+							}
+							if r == '　' { // full-width space
+								return ' '
+							}
+							return r
+						}, v)
+						
+						// Trim spaces and ensure non-empty value
+						sanitized = strings.TrimSpace(sanitized)
+						if sanitized != "" {
+							sanitizedMetadata[k] = sanitized
+						}
+					}
+					opts.UserMetadata = sanitizedMetadata
+				}
+
+				// Ensure content type is set
+				if strings.HasSuffix(strings.ToLower(fullPath), ".pdf") {
+					opts.ContentType = "application/pdf"
+				} else if strings.HasSuffix(strings.ToLower(fullPath), ".docx") {
+					opts.ContentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+				} else if strings.HasSuffix(strings.ToLower(fullPath), ".zip") {
+					opts.ContentType = "application/zip"
 				}
 
 				_, err := s.minioClient.FPutObject(
@@ -367,4 +531,16 @@ func (s *Syncer) SyncFiles() error {
 		fmt.Printf("- Skipped: %d files (%s)\n", progress.SkippedFiles, utils.FormatSize(progress.SkippedSize))
 		return nil
 	}
+}
+
+func sanitizePath(path string) string {
+	// Remove any non-printable characters and normalize spaces
+	sanitized := strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) {
+			return r
+		}
+		return -1
+	}, path)
+	sanitized = strings.TrimSpace(sanitized)
+	return sanitized
 }
