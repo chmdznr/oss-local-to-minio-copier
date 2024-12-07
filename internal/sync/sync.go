@@ -172,7 +172,7 @@ func (p *syncProgress) Print() {
 	avgSpeed, currentSpeed := p.getSpeed()
 	percentage := float64(p.UploadedSize) / float64(p.TotalSize) * 100
 
-	fmt.Printf("\rProgress: %d/%d files (%.1f%%) - %s/%s | Speed: %s (avg: %s) | Retried: %d (%s) - Skipped: %d (%s)",
+	fmt.Printf("\rProgress: %d/%d files (%.1f%%) - %s/%s | Speed: %s (avg: %s) | Retried: %d (%s) - Skipped: %d (%s) | Time Elapsed: %s",
 		p.UploadedFiles,
 		p.TotalFiles,
 		percentage,
@@ -184,6 +184,7 @@ func (p *syncProgress) Print() {
 		utils.FormatSize(p.RetrySize),
 		p.SkippedFiles,
 		utils.FormatSize(p.SkippedSize),
+		utils.FormatDuration(time.Since(p.startTime)), // Add elapsed time
 	)
 }
 
