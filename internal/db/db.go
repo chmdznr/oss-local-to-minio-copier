@@ -409,7 +409,19 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare(`
+	// First prepare statement to get existing record
+	getStmt, err := tx.Prepare(`
+		SELECT file_size, timestamp, status 
+		FROM files 
+		WHERE project_name = ? AND filepath = ?
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare select statement: %v", err)
+	}
+	defer getStmt.Close()
+
+	// Then prepare insert/update statement
+	insertStmt, err := tx.Prepare(`
 		INSERT INTO files (
 			project_name, id_file, id_permohonan, id_from_csv,
 			filepath, file_size, file_type, bucketpath, f_metadata,
@@ -428,14 +440,14 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 			str_key = excluded.str_key,
 			str_subkey = excluded.str_subkey,
 			timestamp = excluded.timestamp,
-			status = excluded.status
+			status = ?  -- Status will be determined separately
 	`)
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	defer insertStmt.Close()
 
-	now := time.Now()
+	now := time.Now().Unix() // Use Unix timestamp for consistent comparison
 	for _, record := range records {
 		metadata := map[string]string{
 			"nama_modul":     record.NamaModul,
@@ -449,7 +461,24 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 			return fmt.Errorf("failed to marshal metadata: %v", err)
 		}
 
-		_, err = stmt.Exec(
+		// Get existing record if any
+		var existingSize int64
+		var existingTimestamp int64
+		var existingStatus string
+		status := "pending" // default for new records
+
+		err = getStmt.QueryRow(projectName, record.Path).Scan(&existingSize, &existingTimestamp, &existingStatus)
+		if err == nil {
+			// Record exists, check if file has changed
+			if existingSize == record.Size && existingTimestamp == now {
+				status = existingStatus // preserve existing status
+			}
+		} else if err != sql.ErrNoRows {
+			return fmt.Errorf("failed to query existing record: %v", err)
+		}
+
+		// Do the insert/update with determined status
+		_, err = insertStmt.Exec(
 			projectName,
 			record.IDUpload,      // id_file
 			record.ID,            // id_permohonan
@@ -464,10 +493,11 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 			record.StrKey,        // str_key
 			record.StrSubKey,     // str_subkey
 			now,                  // timestamp
-			"pending",            // status
+			status,               // determined status
+			status,               // status for ON CONFLICT UPDATE
 		)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to insert/update record: %v", err)
 		}
 	}
 
