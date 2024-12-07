@@ -61,7 +61,7 @@ func (db *DB) initialize() error {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			str_key TEXT,
 			str_subkey TEXT,
-			timestamp TEXT,
+			timestamp INTEGER,
 			status TEXT DEFAULT 'pending',
 			UNIQUE(project_name, filepath)
 		);
