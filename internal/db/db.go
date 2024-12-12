@@ -463,15 +463,18 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 
 		// Get existing record if any
 		var existingSize int64
-		var existingTimestamp int64
+		var existingTimestamp time.Time
 		var existingStatus string
 		status := "pending" // default for new records
 
 		err = getStmt.QueryRow(projectName, record.Path).Scan(&existingSize, &existingTimestamp, &existingStatus)
 		if err == nil {
-			// Record exists, check if file has changed
-			if existingSize == record.Size && existingTimestamp == now {
-				status = existingStatus // preserve existing status
+			// Record exists, check if file has changed by comparing size and modification time
+			recordModTime := time.Unix(record.ModTime, 0)
+			if existingSize == record.Size && existingTimestamp.Equal(recordModTime) {
+				status = existingStatus // preserve existing status if file hasn't changed
+			} else {
+				status = "pending" // file has changed, needs re-upload
 			}
 		} else if err != sql.ErrNoRows {
 			return fmt.Errorf("failed to query existing record: %v", err)
@@ -492,7 +495,7 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 			now,                  // created_at
 			record.StrKey,        // str_key
 			record.StrSubKey,     // str_subkey
-			now,                  // timestamp
+			time.Unix(record.ModTime, 0), // timestamp - use file's modification time as time.Time
 			status,               // determined status
 			status,               // status for ON CONFLICT UPDATE
 		)

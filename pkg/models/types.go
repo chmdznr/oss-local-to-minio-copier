@@ -25,6 +25,7 @@ type CSVRecord struct {
 	StrKey       string `csv:"str_key"`
 	StrSubKey    string `csv:"str_subkey"`
 	Size         int64  `csv:"-"` // This is computed from the actual file
+	ModTime      int64  `csv:"-"` // This is computed from the actual file's modification time
 }
 
 // FileRecord represents a file record in the database

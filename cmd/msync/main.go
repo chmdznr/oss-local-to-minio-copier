@@ -430,6 +430,7 @@ func importCSV(c *cli.Context) error {
 			StrKey:       row[headerMap["str_key"]],
 			StrSubKey:    row[headerMap["str_subkey"]],
 			Size:         fileInfo.Size(),
+			ModTime:      fileInfo.ModTime().Unix(), // Add file modification time
 		}
 
 		records = append(records, record)
@@ -445,7 +446,7 @@ func importCSV(c *cli.Context) error {
 				return fmt.Errorf("failed to save batch: %v", err)
 			}
 			records = records[:0]
-			fmt.Printf("\rProcessed %d new files, updated %d files (%s), skipped %d files", 
+			fmt.Printf("\rProcessed %d new files, updated %d files (%s), skipped %d files",
 				recordCount,
 				updatedCount,
 				utils.FormatSize(totalSize),
