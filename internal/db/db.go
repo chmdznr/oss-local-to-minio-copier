@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/models"
@@ -61,7 +62,7 @@ func (db *DB) initialize() error {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			str_key TEXT,
 			str_subkey TEXT,
-			timestamp INTEGER,
+			timestamp TEXT,
 			status TEXT DEFAULT 'pending',
 			UNIQUE(project_name, filepath)
 		);
@@ -168,7 +169,13 @@ func (db *DB) GetPendingFiles(projectName string) ([]models.FileRecord, error) {
 		}
 
 		// Parse timestamps
-		file.Timestamp, _ = time.Parse("2006-01-02 15:04:05", timestamp)
+		if timestamp != "" {
+			if t, err := time.Parse(time.RFC3339, timestamp); err == nil {
+				file.Timestamp = t
+			} else if t, err := strconv.ParseInt(timestamp, 10, 64); err == nil {
+				file.Timestamp = time.Unix(t, 0)
+			}
+		}
 
 		// Initialize empty metadata map
 		file.Metadata = make(map[string]string)
@@ -203,7 +210,7 @@ func (db *DB) UpdateFileStatus(projectName, filePath, status string) error {
 			timestamp = ?,
 			created_at = ?
 		WHERE project_name = ? AND filepath = ?
-	`, status, now, now, projectName, filePath)
+	`, status, now.Format(time.RFC3339), now.Format(time.RFC3339), projectName, filePath)
 	return err
 }
 
@@ -230,7 +237,7 @@ func (db *DB) UpdateFileStatusBatch(projectName string, filePaths []string, stat
 	defer stmt.Close()
 
 	for _, filePath := range filePaths {
-		_, err = stmt.Exec(status, now, now, projectName, filePath)
+		_, err = stmt.Exec(status, now.Format(time.RFC3339), now.Format(time.RFC3339), projectName, filePath)
 		if err != nil {
 			return err
 		}
@@ -244,7 +251,7 @@ func (db *DB) SaveFileRecord(projectName string, record *models.FileRecord) erro
 	_, err := db.Exec(`
 		INSERT OR REPLACE INTO files (project_name, filepath, status, timestamp)
 		VALUES (?, ?, ?, ?)
-	`, projectName, record.FilePath, record.UploadStatus, record.Timestamp)
+	`, projectName, record.FilePath, record.UploadStatus, record.Timestamp.Format(time.RFC3339))
 	return err
 }
 
@@ -270,7 +277,7 @@ func (db *DB) SaveFileRecordsBatch(projectName string, records []models.FileReco
 			projectName,
 			record.FilePath,
 			record.UploadStatus,
-			record.Timestamp,
+			record.Timestamp.Format(time.RFC3339),
 		)
 		if err != nil {
 			return err
@@ -387,13 +394,13 @@ func (db *DB) SaveFileRecordFromCSV(projectName string, csvRecord *models.CSVRec
 		projectName,
 		csvRecord.IDUpload,   // id_file
 		csvRecord.StrKey,     // id_permohonan
-		time.Now(),           // timestamp
+		time.Now().Format(time.RFC3339),           // timestamp
 		csvRecord.Path,       // filepath
 		"pending",            // status
 		"",                   // bucketpath (to be set during upload)
 		string(metadataJSON), // f_metadata
 		"migrator",           // userid
-		time.Now(),           // created_at
+		time.Now().Format(time.RFC3339),           // created_at
 		csvRecord.StrKey,     // str_key
 		csvRecord.StrSubKey,  // str_subkey
 	)
@@ -447,7 +454,7 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 	}
 	defer insertStmt.Close()
 
-	now := time.Now().Unix() // Use Unix timestamp for consistent comparison
+	now := time.Now()
 	for _, record := range records {
 		metadata := map[string]string{
 			"nama_modul":     record.NamaModul,
@@ -463,13 +470,26 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 
 		// Get existing record if any
 		var existingSize int64
-		var existingTimestamp time.Time
+		var existingTimestampStr string
 		var existingStatus string
 		status := "pending" // default for new records
 
-		err = getStmt.QueryRow(projectName, record.Path).Scan(&existingSize, &existingTimestamp, &existingStatus)
+		err = getStmt.QueryRow(projectName, record.Path).Scan(&existingSize, &existingTimestampStr, &existingStatus)
 		if err == nil {
 			// Record exists, check if file has changed by comparing size and modification time
+			var existingTimestamp time.Time
+			if existingTimestampStr != "" {
+				// Try parsing as Unix timestamp first
+				if timestamp, err := strconv.ParseInt(existingTimestampStr, 10, 64); err == nil {
+					existingTimestamp = time.Unix(timestamp, 0)
+				} else {
+					// If not Unix timestamp, try parsing as RFC3339
+					if t, err := time.Parse(time.RFC3339, existingTimestampStr); err == nil {
+						existingTimestamp = t
+					}
+				}
+			}
+			
 			recordModTime := time.Unix(record.ModTime, 0)
 			if existingSize == record.Size && existingTimestamp.Equal(recordModTime) {
 				status = existingStatus // preserve existing status if file hasn't changed
@@ -479,6 +499,9 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 		} else if err != sql.ErrNoRows {
 			return fmt.Errorf("failed to query existing record: %v", err)
 		}
+
+		// Convert ModTime to string format for database
+		modTimeStr := fmt.Sprintf("%d", record.ModTime)  // Store as Unix timestamp string
 
 		// Do the insert/update with determined status
 		_, err = insertStmt.Exec(
@@ -492,10 +515,10 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 			"",                   // bucketpath (to be set during upload)
 			string(metadataJSON), // f_metadata
 			"migrator",           // userid
-			now,                  // created_at
+			now.Format(time.RFC3339), // created_at
 			record.StrKey,        // str_key
 			record.StrSubKey,     // str_subkey
-			time.Unix(record.ModTime, 0), // timestamp - use file's modification time as time.Time
+			modTimeStr,           // timestamp - store as string
 			status,               // determined status
 			status,               // status for ON CONFLICT UPDATE
 		)
@@ -532,7 +555,13 @@ func (db *DB) GetProjectFiles(projectName string) ([]models.FileRecord, error) {
 		if err != nil {
 			return nil, err
 		}
-		file.Timestamp, _ = time.Parse("2006-01-02 15:04:05", timestamp)
+		if timestamp != "" {
+			if t, err := time.Parse(time.RFC3339, timestamp); err == nil {
+				file.Timestamp = t
+			} else if t, err := strconv.ParseInt(timestamp, 10, 64); err == nil {
+				file.Timestamp = time.Unix(t, 0)
+			}
+		}
 
 		// Parse metadata if present
 		if metadataStr != "" {
