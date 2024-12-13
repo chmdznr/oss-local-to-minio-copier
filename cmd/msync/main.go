@@ -217,9 +217,12 @@ func syncFiles(c *cli.Context) error {
 		return fmt.Errorf("failed to get project details: %v", err)
 	}
 
-	// Create syncer with default config
-	defaultConfig := syncer.DefaultSyncerConfig()
-	s, err := syncer.NewSyncer(db, project, &defaultConfig)
+	// Create syncer with config from command line arguments
+	config := syncer.SyncerConfig{
+		NumWorkers: c.Int("workers"),
+		BatchSize:  c.Int("batch"),
+	}
+	s, err := syncer.NewSyncer(db, project, &config)
 	if err != nil {
 		return fmt.Errorf("failed to create syncer: %v", err)
 	}

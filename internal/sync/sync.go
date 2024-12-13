@@ -73,7 +73,7 @@ func newWorkerProgress(id int, totalFiles, totalSize int64) *workerProgress {
 func (wp *workerProgress) update(size int64) {
 	wp.processedFiles++
 	wp.processedSize += size
-	wp.bar.Increment()
+	wp.bar.SetCurrent(wp.processedFiles)
 }
 
 func (wp *workerProgress) start() {
@@ -82,6 +82,109 @@ func (wp *workerProgress) start() {
 
 func (wp *workerProgress) finish() {
 	wp.bar.Finish()
+}
+
+type syncProgress struct {
+	TotalFiles    int64
+	TotalSize     int64
+	UploadedFiles int64
+	UploadedSize  int64
+	SkippedFiles  int64
+	SkippedSize   int64
+	RetryFiles    int64
+	RetrySize     int64
+	startTime     time.Time
+	lastUpdate    time.Time
+	lastSize      int64
+	bar          *pb.ProgressBar
+	sync.Mutex
+}
+
+func newSyncProgress(totalFiles int64, totalSize int64) *syncProgress {
+	now := time.Now()
+	bar := pb.New64(totalFiles)
+	bar.Set(pb.Bytes, true)
+	bar.SetTemplate(`Total Progress: {{counters . }} {{bar . }} {{percent . }} | Speed: {{speed . }} (avg: {{string . "avgSpeed"}}) | Retried: {{string . "retried"}} - Skipped: {{string . "skipped"}} | Time: {{string . "elapsed"}}`)
+	return &syncProgress{
+		TotalFiles: totalFiles,
+		TotalSize:  totalSize,
+		startTime:  now,
+		lastUpdate: now,
+		bar:        bar,
+	}
+}
+
+func (p *syncProgress) Update(size int64, isRetry bool) {
+	p.Lock()
+	defer p.Unlock()
+	p.UploadedFiles++
+	p.UploadedSize += size
+	if isRetry {
+		p.RetryFiles++
+		p.RetrySize += size
+	}
+	p.updateBar()
+}
+
+func (p *syncProgress) Skip(size int64) {
+	p.Lock()
+	defer p.Unlock()
+	p.SkippedFiles++
+	p.SkippedSize += size
+	p.updateBar()
+}
+
+func (p *syncProgress) updateBar() {
+	avgSpeed, _ := p.getSpeed()
+	p.bar.Set("avgSpeed", formatSpeed(avgSpeed))
+	p.bar.Set("retried", fmt.Sprintf("%d (%s)", p.RetryFiles, utils.FormatSize(p.RetrySize)))
+	p.bar.Set("skipped", fmt.Sprintf("%d (%s)", p.SkippedFiles, utils.FormatSize(p.SkippedSize)))
+	p.bar.Set("elapsed", utils.FormatDuration(time.Since(p.startTime)))
+	p.bar.SetCurrent(p.UploadedFiles)
+}
+
+func (p *syncProgress) Print() {
+	// This is now handled by the progress bar
+}
+
+func (p *syncProgress) start() {
+	p.bar.Start()
+}
+
+func (p *syncProgress) finish() {
+	p.bar.Finish()
+}
+
+func (p *syncProgress) getSpeed() (avgSpeed float64, currentSpeed float64) {
+	now := time.Now()
+	totalDuration := now.Sub(p.startTime).Seconds()
+	if totalDuration > 0 {
+		avgSpeed = float64(p.UploadedSize) / totalDuration
+	}
+
+	// Calculate current speed over the last update interval
+	intervalDuration := now.Sub(p.lastUpdate).Seconds()
+	sizeDiff := float64(p.UploadedSize - p.lastSize)
+	if intervalDuration > 0 {
+		currentSpeed = sizeDiff / intervalDuration
+	}
+
+	// Update last values for next calculation
+	p.lastUpdate = now
+	p.lastSize = p.UploadedSize
+
+	return avgSpeed, currentSpeed
+}
+
+func formatSpeed(bytesPerSecond float64) string {
+	if bytesPerSecond < 1024 {
+		return fmt.Sprintf("%.1f B/s", bytesPerSecond)
+	} else if bytesPerSecond < 1024*1024 {
+		return fmt.Sprintf("%.1f KB/s", bytesPerSecond/1024)
+	} else if bytesPerSecond < 1024*1024*1024 {
+		return fmt.Sprintf("%.1f MB/s", bytesPerSecond/1024/1024)
+	}
+	return fmt.Sprintf("%.1f GB/s", bytesPerSecond/1024/1024/1024)
 }
 
 // NewSyncer creates a new syncer instance
@@ -126,104 +229,6 @@ func NewSyncer(db *db.DB, project *models.Project, config *SyncerConfig) (*Synce
 		numWorkers:  config.NumWorkers,
 		batchSize:   config.BatchSize,
 	}, nil
-}
-
-type syncProgress struct {
-	TotalFiles    int64
-	TotalSize     int64
-	UploadedFiles int64
-	UploadedSize  int64
-	SkippedFiles  int64
-	SkippedSize   int64
-	RetryFiles    int64
-	RetrySize     int64
-	startTime     time.Time
-	lastUpdate    time.Time
-	lastSize      int64
-	sync.Mutex
-}
-
-func newSyncProgress(totalFiles int64, totalSize int64) *syncProgress {
-	now := time.Now()
-	return &syncProgress{
-		TotalFiles: totalFiles,
-		TotalSize:  totalSize,
-		startTime:  now,
-		lastUpdate: now,
-	}
-}
-
-func (p *syncProgress) Update(size int64, isRetry bool) {
-	p.Lock()
-	defer p.Unlock()
-	p.UploadedFiles++
-	p.UploadedSize += size
-	if isRetry {
-		p.RetryFiles++
-		p.RetrySize += size
-	}
-}
-
-func (p *syncProgress) Skip(size int64) {
-	p.Lock()
-	defer p.Unlock()
-	p.SkippedFiles++
-	p.SkippedSize += size
-}
-
-func (p *syncProgress) getSpeed() (avgSpeed float64, currentSpeed float64) {
-	now := time.Now()
-	totalDuration := now.Sub(p.startTime).Seconds()
-	if totalDuration > 0 {
-		avgSpeed = float64(p.UploadedSize) / totalDuration
-	}
-
-	// Calculate current speed over the last update interval
-	intervalDuration := now.Sub(p.lastUpdate).Seconds()
-	sizeDiff := float64(p.UploadedSize - p.lastSize)
-	if intervalDuration > 0 {
-		currentSpeed = sizeDiff / intervalDuration
-	}
-
-	// Update last values for next calculation
-	p.lastUpdate = now
-	p.lastSize = p.UploadedSize
-
-	return avgSpeed, currentSpeed
-}
-
-func formatSpeed(bytesPerSecond float64) string {
-	if bytesPerSecond < 1024 {
-		return fmt.Sprintf("%.1f B/s", bytesPerSecond)
-	} else if bytesPerSecond < 1024*1024 {
-		return fmt.Sprintf("%.1f KB/s", bytesPerSecond/1024)
-	} else if bytesPerSecond < 1024*1024*1024 {
-		return fmt.Sprintf("%.1f MB/s", bytesPerSecond/1024/1024)
-	}
-	return fmt.Sprintf("%.1f GB/s", bytesPerSecond/1024/1024/1024)
-}
-
-func (p *syncProgress) Print() {
-	p.Lock()
-	defer p.Unlock()
-
-	avgSpeed, currentSpeed := p.getSpeed()
-	percentage := float64(p.UploadedSize) / float64(p.TotalSize) * 100
-
-	fmt.Printf("\rProgress: %d/%d files (%.1f%%) - %s/%s | Speed: %s (avg: %s) | Retried: %d (%s) - Skipped: %d (%s) | Time Elapsed: %s",
-		p.UploadedFiles,
-		p.TotalFiles,
-		percentage,
-		utils.FormatSize(p.UploadedSize),
-		utils.FormatSize(p.TotalSize),
-		formatSpeed(currentSpeed),
-		formatSpeed(avgSpeed),
-		p.RetryFiles,
-		utils.FormatSize(p.RetrySize),
-		p.SkippedFiles,
-		utils.FormatSize(p.SkippedSize),
-		utils.FormatDuration(time.Since(p.startTime)), // Add elapsed time
-	)
 }
 
 func (s *Syncer) uploadFile(file models.FileRecord) error {
@@ -284,7 +289,6 @@ func (s *Syncer) uploadFile(file models.FileRecord) error {
 func (s *Syncer) SyncFiles() error {
 	// Create worker pool
 	var wg sync.WaitGroup
-	var workerWg sync.WaitGroup
 	files, err := s.db.GetPendingFiles(s.project.Name)
 	if err != nil {
 		return err
@@ -306,11 +310,18 @@ func (s *Syncer) SyncFiles() error {
 		utils.FormatSize(progress.TotalSize),
 		retriesCount)
 
+	// Calculate files per worker
 	filesPerWorker := len(files) / s.numWorkers
 	if filesPerWorker == 0 {
 		filesPerWorker = 1
 	}
 	workerProgresses := make([]*workerProgress, s.numWorkers)
+
+	// Start global progress bar first
+	progress.start()
+	fmt.Println() // Add a newline before worker progress bars
+
+	// Start worker progress bars
 	for i := 0; i < s.numWorkers; i++ {
 		wg.Add(1)
 		startIdx := i * filesPerWorker
@@ -325,10 +336,8 @@ func (s *Syncer) SyncFiles() error {
 		}
 		workerProgresses[i] = newWorkerProgress(i, workerFiles, workerSize)
 		workerProgresses[i].start()
-		workerWg.Add(1)
 		go func(id int, startIdx, endIdx int) {
 			defer wg.Done()
-			defer workerWg.Done()
 			var completedFiles []string
 
 			// Process only files assigned to this worker
@@ -355,7 +364,7 @@ func (s *Syncer) SyncFiles() error {
 				if _, err := os.Stat(fullPath); os.IsNotExist(err) {
 					log.Printf("\nSkipping %s: file no longer exists\n", file.FilePath)
 					progress.Skip(file.Size)
-					progress.Print()
+					progress.updateBar()
 
 					// Mark as skipped in database
 					if err := s.db.UpdateFileStatus(s.project.Name, file.FilePath, "skipped"); err != nil {
@@ -467,7 +476,7 @@ func (s *Syncer) SyncFiles() error {
 				completedFiles = append(completedFiles, file.FilePath)
 				progress.Update(file.Size, file.UploadStatus == "failed")
 				workerProgresses[id].update(file.Size)
-				progress.Print()
+				progress.updateBar()
 
 				// Update progress in batches
 				if len(completedFiles) >= s.batchSize {
@@ -478,12 +487,12 @@ func (s *Syncer) SyncFiles() error {
 	}
 
 	wg.Wait()
-	workerWg.Wait()
 
 	// Finish progress bars
 	for _, wp := range workerProgresses {
 		wp.finish()
 	}
+	progress.finish()
 
 	avgSpeed, _ := progress.getSpeed()
 	fmt.Printf("\nSync completed in %s:\n", time.Since(progress.startTime).Round(time.Second))
