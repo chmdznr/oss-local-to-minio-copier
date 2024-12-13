@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cheggaaa/pb/v3"
 	"github.com/chmdznr/oss-local-to-minio-copier/internal/db"
 	syncer "github.com/chmdznr/oss-local-to-minio-copier/internal/sync"
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/models"
@@ -395,33 +396,52 @@ func importCSV(c *cli.Context) error {
 		existingFilesMap[f.FilePath] = true
 	}
 
-	// Create channels for worker pool
 	type workResult struct {
-		newCount     int
-		updateCount  int
-		skipCount    int
-		totalSize    int64
-		records      []models.CSVRecord
-		err          error
+		records     []models.CSVRecord
+		totalSize   int64
+		newCount    int
+		updateCount int
+		skipCount   int
+		err         error
 	}
 
-	jobs := make(chan int, numWorkers)
 	results := make(chan workResult, numWorkers)
 	dbMutex := &sync.Mutex{} // Mutex for database operations
 
-	// Calculate rows per worker and remainder
-	rowsPerWorker := totalRows / numWorkers
-	remainderRows := totalRows % numWorkers
+	// Create progress bars for each worker
+	bars := make([]*pb.ProgressBar, numWorkers)
+	workerRowCounts := make([]int, numWorkers)
+	
+	// Calculate exact number of rows for each worker
+	remainingRows := totalRows
+	for i := range bars {
+		// Calculate rows for this worker
+		rowCount := remainingRows / (numWorkers - i)
+		workerRowCounts[i] = rowCount
+		remainingRows -= rowCount
 
-	if rowsPerWorker < batchSize {
-		// If we have fewer rows than batch size * workers, adjust workers down
-		numWorkers = (totalRows + batchSize - 1) / batchSize
-		rowsPerWorker = totalRows / numWorkers
-		remainderRows = totalRows % numWorkers
+		// Create progress bar
+		bars[i] = pb.New(rowCount)
+		bars[i].Set("prefix", fmt.Sprintf("Worker %d ", i))
+		bars[i].SetMaxWidth(100)
 	}
 
-	fmt.Printf("Starting import with %d workers, processing %d rows (base rows per worker: %d, remainder: %d)...\n", 
-		numWorkers, totalRows, rowsPerWorker, remainderRows)
+	fmt.Printf("Starting import with %d workers, processing %d rows...\n", numWorkers, totalRows)
+	for i, count := range workerRowCounts {
+		fmt.Printf("Worker %d will process %d rows\n", i, count)
+	}
+
+	pool, err := pb.StartPool(bars...)
+	if err != nil {
+		return fmt.Errorf("error creating progress pool: %v", err)
+	}
+	defer pool.Stop()
+
+	// Create channels for each worker
+	workerChannels := make([]chan []string, numWorkers)
+	for i := range workerChannels {
+		workerChannels[i] = make(chan []string, numWorkers)
+	}
 
 	// Start workers
 	var wg sync.WaitGroup
@@ -430,117 +450,68 @@ func importCSV(c *cli.Context) error {
 		go func(workerID int) {
 			defer wg.Done()
 
-			workerFile, err := os.Open(csvPath)
-			if err != nil {
-				results <- workResult{err: fmt.Errorf("worker %d failed to open CSV: %v", workerID, err)}
-				return
-			}
-			defer workerFile.Close()
-
-			workerReader := csv.NewReader(workerFile)
-			workerReader.FieldsPerRecord = -1
-
-			// Skip header
-			_, err = workerReader.Read()
-			if err != nil {
-				results <- workResult{err: fmt.Errorf("worker %d failed to read header: %v", workerID, err)}
-				return
-			}
-
 			var records []models.CSVRecord
 			result := workResult{}
+			rowCount := 0
 
-			for startRow := range jobs {
-				// Calculate this worker's actual row range
-				extraRow := 0
-				if workerID < remainderRows {
-					extraRow = 1
-				}
-				endRow := startRow + rowsPerWorker + extraRow - 1
-				if endRow > totalRows {
-					endRow = totalRows
-				}
+			// Get progress bar for this worker
+			bar := bars[workerID]
 
-				log.Printf("Worker %d processing rows %d to %d", workerID, startRow, endRow)
-
-				// Skip to start row
-				for i := 1; i < startRow; i++ {
-					if _, err := workerReader.Read(); err != nil {
-						results <- workResult{err: fmt.Errorf("worker %d failed to skip to start: %v", workerID, err)}
-						return
-					}
+			// Process rows sent to this worker
+			for row := range workerChannels[workerID] {
+				rowCount++
+				filePath := row[headerMap["path"]]
+				if filePath == "" {
+					continue
 				}
 
-				// Process assigned rows
-				for currentRow := startRow; currentRow <= endRow; currentRow++ {
-					row, err := workerReader.Read()
-					if err == io.EOF {
-						break
-					}
-					if err != nil {
-						results <- workResult{err: fmt.Errorf("worker %d failed to read row: %v", workerID, err)}
-						return
-					}
-
-					filePath := row[headerMap["path"]]
-					idUpload := row[headerMap["id_upload"]]
-					fullPath := filepath.Join(project.SourcePath, filePath)
-
-					// Check if file exists and get its info
-					fileInfo, err := os.Stat(fullPath)
-					if err != nil {
-						if os.IsNotExist(err) {
-							result.skipCount++
-							dbMutex.Lock()
-							if err := db.AddMissingFile(fullPath, idUpload, currentRow+2); err != nil {
-								log.Printf("Error recording missing file: %v", err)
-							}
-							dbMutex.Unlock()
-							continue
-						}
-						results <- workResult{err: fmt.Errorf("failed to get file info for %s: %v", filePath, err)}
-						return
-					}
-
-					// Skip directories
-					if fileInfo.IsDir() {
-						result.skipCount++
+				// Check if file exists
+				fileInfo, err := os.Stat(filepath.Join(project.SourcePath, filePath))
+				if err != nil {
+					if os.IsNotExist(err) {
+						log.Printf("Warning: File not found: %s", filePath)
 						continue
 					}
+					results <- workResult{err: fmt.Errorf("worker %d failed to stat file: %v", workerID, err)}
+					return
+				}
 
-					record := models.CSVRecord{
-						IDUpload:     idUpload,
-						Path:         filePath,
-						NamaModul:    row[headerMap["nama_modul"]],
-						FileType:     row[headerMap["file_type"]],
-						NamaFileAsli: row[headerMap["nama_file_asli"]],
-						IDProfile:    row[headerMap["id_profile"]],
-						ID:           row[headerMap["id"]],
-						StrKey:       row[headerMap["str_key"]],
-						StrSubKey:    row[headerMap["str_subkey"]],
-						Size:         fileInfo.Size(),
-						ModTime:      fileInfo.ModTime().Unix(),
-					}
+				idUpload := row[headerMap["id_upload"]]
 
-					records = append(records, record)
-					result.totalSize += fileInfo.Size()
+				record := models.CSVRecord{
+					IDUpload:     idUpload,
+					Path:         filePath,
+					NamaModul:    row[headerMap["nama_modul"]],
+					FileType:     row[headerMap["file_type"]],
+					NamaFileAsli: row[headerMap["nama_file_asli"]],
+					IDProfile:    row[headerMap["id_profile"]],
+					ID:           row[headerMap["id"]],
+					StrKey:       row[headerMap["str_key"]],
+					StrSubKey:    row[headerMap["str_subkey"]],
+					Size:         fileInfo.Size(),
+					ModTime:      fileInfo.ModTime().Unix(),
+				}
 
-					if existingFilesMap[filePath] {
-						result.updateCount++
-					} else {
-						result.newCount++
-					}
+				records = append(records, record)
+				result.totalSize += fileInfo.Size()
 
-					if len(records) >= batchSize {
-						dbMutex.Lock()
-						if err := db.SaveFileRecordsFromCSVBatch(projectName, records); err != nil {
-							dbMutex.Unlock()
-							results <- workResult{err: fmt.Errorf("worker %d failed to save batch: %v", workerID, err)}
-							return
-						}
+				if existingFilesMap[filePath] {
+					result.updateCount++
+				} else {
+					result.newCount++
+				}
+
+				bar.Increment()
+
+				if len(records) >= batchSize {
+					dbMutex.Lock()
+					if err := db.SaveFileRecordsFromCSVBatch(projectName, records); err != nil {
 						dbMutex.Unlock()
-						records = records[:0]
+						results <- workResult{err: fmt.Errorf("worker %d failed to save batch: %v", workerID, err)}
+						return
 					}
+					dbMutex.Unlock()
+					records = records[:0]
 				}
 			}
 
@@ -553,29 +524,36 @@ func importCSV(c *cli.Context) error {
 		}(i)
 	}
 
-	// Distribute work to workers
+	// Distribute rows to workers
 	go func() {
-		currentRow := 1
-		for workerID := 0; workerID < numWorkers; workerID++ {
-			// Calculate this worker's row count
-			extraRow := 0
-			if workerID < remainderRows {
-				extraRow = 1
-			}
-			workerRows := rowsPerWorker + extraRow
-			
-			endRow := currentRow + workerRows - 1
-			if endRow > totalRows {
-				endRow = totalRows
-			}
-			
-			log.Printf("Assigning rows %d to %d to worker %d", currentRow, endRow, workerID)
-			jobs <- currentRow
-			currentRow += workerRows
-		}
-		close(jobs)
-	}()
+		currentWorker := 0
+		rowsDistributed := make([]int, numWorkers)
 
+		for {
+			row, err := reader.Read()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				log.Printf("Error reading row: %v", err)
+				continue
+			}
+
+			// Find next worker that hasn't reached its quota
+			for rowsDistributed[currentWorker] >= workerRowCounts[currentWorker] {
+				currentWorker = (currentWorker + 1) % numWorkers
+			}
+
+			workerChannels[currentWorker] <- row
+			rowsDistributed[currentWorker]++
+			currentWorker = (currentWorker + 1) % numWorkers
+		}
+
+		// Close all worker channels
+		for _, ch := range workerChannels {
+			close(ch)
+		}
+	}()
 	// Wait for all workers and collect results
 	go func() {
 		wg.Wait()
