@@ -319,10 +319,24 @@ func (s *Syncer) SyncFiles() error {
 
 	// Start workers
 	var wg sync.WaitGroup
+	filesPerWorker := len(files) / s.numWorkers
+	if filesPerWorker == 0 {
+		filesPerWorker = 1
+	}
 	workerProgresses := make([]*workerProgress, s.numWorkers)
 	for i := 0; i < s.numWorkers; i++ {
 		wg.Add(1)
-		workerProgresses[i] = newWorkerProgress(i, progress.TotalFiles, progress.TotalSize)
+		startIdx := i * filesPerWorker
+		endIdx := (i + 1) * filesPerWorker
+		if i == s.numWorkers-1 {
+			endIdx = len(files)
+		}
+		workerFiles := int64(endIdx - startIdx)
+		var workerSize int64
+		for j := startIdx; j < endIdx && j < len(files); j++ {
+			workerSize += files[j].Size
+		}
+		workerProgresses[i] = newWorkerProgress(i, workerFiles, workerSize)
 		workerProgresses[i].start()
 		go func(id int) {
 			defer wg.Done()
