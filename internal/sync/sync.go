@@ -283,19 +283,8 @@ func (s *Syncer) uploadFile(file models.FileRecord) error {
 
 func (s *Syncer) SyncFiles() error {
 	// Create worker pool
-	type workItem struct {
-		filePath        string
-		destinationPath string
-		size            int64
-		isRetry         bool
-		metadata        map[string]string
-	}
-
-	jobs := make(chan workItem, s.numWorkers)
-	results := make(chan []string, s.numWorkers)
-	errors := make(chan error, 1)
-
-	// Initialize progress tracking
+	var wg sync.WaitGroup
+	var workerWg sync.WaitGroup
 	files, err := s.db.GetPendingFiles(s.project.Name)
 	if err != nil {
 		return err
@@ -317,8 +306,6 @@ func (s *Syncer) SyncFiles() error {
 		utils.FormatSize(progress.TotalSize),
 		retriesCount)
 
-	// Start workers
-	var wg sync.WaitGroup
 	filesPerWorker := len(files) / s.numWorkers
 	if filesPerWorker == 0 {
 		filesPerWorker = 1
@@ -338,32 +325,51 @@ func (s *Syncer) SyncFiles() error {
 		}
 		workerProgresses[i] = newWorkerProgress(i, workerFiles, workerSize)
 		workerProgresses[i].start()
-		go func(id int) {
+		workerWg.Add(1)
+		go func(id int, startIdx, endIdx int) {
 			defer wg.Done()
+			defer workerWg.Done()
 			var completedFiles []string
 
-			for job := range jobs {
-				fullPath := filepath.Join(s.project.SourcePath, job.filePath)
+			// Process only files assigned to this worker
+			for j := startIdx; j < endIdx && j < len(files); j++ {
+				file := files[j]
+				// Ensure folder has trailing slash and construct path
+				folder := strings.TrimRight(s.project.Destination.Folder, "/") + "/"
+				destinationPath := fmt.Sprintf("%s%s", folder, file.IDFile)
+
+				// Create complete metadata
+				metadata := file.Metadata
+				if metadata == nil {
+					metadata = make(map[string]string)
+				}
+
+				// Preserve existing metadata values and set bucket without URL encoding
+				metadata["path"] = sanitizePath(file.FilePath)
+				metadata["bucket"] = fmt.Sprintf("%s/%s", s.project.Destination.Bucket, strings.TrimPrefix(destinationPath, "/"))
+				metadata["existing_id"] = file.IDFromCSV
+
+				fullPath := filepath.Join(s.project.SourcePath, file.FilePath)
 
 				// Check if file still exists
 				if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-					log.Printf("\nSkipping %s: file no longer exists\n", job.filePath)
-					progress.Skip(job.size)
+					log.Printf("\nSkipping %s: file no longer exists\n", file.FilePath)
+					progress.Skip(file.Size)
 					progress.Print()
 
 					// Mark as skipped in database
-					if err := s.db.UpdateFileStatus(s.project.Name, job.filePath, "skipped"); err != nil {
-						log.Printf("\nFailed to update status for %s: %v\n", job.filePath, err)
+					if err := s.db.UpdateFileStatus(s.project.Name, file.FilePath, "skipped"); err != nil {
+						log.Printf("\nFailed to update status for %s: %v\n", file.FilePath, err)
 					}
 					continue
 				}
 
 				// Set metadata if available
 				var opts minio.PutObjectOptions
-				if job.metadata != nil {
+				if metadata != nil {
 					// Sanitize metadata values and handle special cases
 					sanitizedMetadata := make(map[string]string)
-					for k, v := range job.metadata {
+					for k, v := range metadata {
 						sanitized := v
 						if k == "path" {
 							// Special handling for path metadata
@@ -404,16 +410,16 @@ func (s *Syncer) SyncFiles() error {
 				objInfo, err := s.minioClient.FPutObject(
 					context.Background(),
 					s.project.Destination.Bucket,
-					job.destinationPath,
+					destinationPath,
 					fullPath,
 					opts,
 				)
 
 				if err != nil {
 					// Log detailed error information
-					log.Printf("\nFailed to upload %s (attempt %d):\n", job.filePath, 1)
+					log.Printf("\nFailed to upload %s (attempt %d):\n", file.FilePath, 1)
 					log.Printf("  Local path: %s\n", fullPath)
-					log.Printf("  Destination: %s/%s\n", s.project.Destination.Bucket, job.destinationPath)
+					log.Printf("  Destination: %s/%s\n", s.project.Destination.Bucket, destinationPath)
 					log.Printf("  Error: %v\n", err)
 
 					// Check if it's a MinIO error
@@ -426,41 +432,41 @@ func (s *Syncer) SyncFiles() error {
 					}
 
 					// Mark as failed in database
-					if dbErr := s.db.UpdateFileStatus(s.project.Name, job.filePath, "failed"); dbErr != nil {
-						log.Printf("Failed to update status for %s: %v\n", job.filePath, dbErr)
+					if dbErr := s.db.UpdateFileStatus(s.project.Name, file.FilePath, "failed"); dbErr != nil {
+						log.Printf("Failed to update status for %s: %v\n", file.FilePath, dbErr)
 					}
 					continue
 				}
 
 				// Verify upload was successful by checking object info
-				if objInfo.Size != job.size {
-					log.Printf("\nWarning: Uploaded file size mismatch for %s:\n", job.filePath)
-					log.Printf("  Expected: %d bytes\n", job.size)
+				if objInfo.Size != file.Size {
+					log.Printf("\nWarning: Uploaded file size mismatch for %s:\n", file.FilePath)
+					log.Printf("  Expected: %d bytes\n", file.Size)
 					log.Printf("  Actual: %d bytes\n", objInfo.Size)
-					if dbErr := s.db.UpdateFileStatus(s.project.Name, job.filePath, "failed"); dbErr != nil {
-						log.Printf("Failed to update status for %s: %v\n", job.filePath, dbErr)
+					if dbErr := s.db.UpdateFileStatus(s.project.Name, file.FilePath, "failed"); dbErr != nil {
+						log.Printf("Failed to update status for %s: %v\n", file.FilePath, dbErr)
 					}
 					continue
 				}
 
 				// After successful upload and verification, update the metadata in database
-				metadataJSON, err := json.Marshal(job.metadata)
+				metadataJSON, err := json.Marshal(metadata)
 				if err != nil {
-					log.Printf("\nWarning: Failed to marshal metadata for %s: %v\n", job.filePath, err)
+					log.Printf("\nWarning: Failed to marshal metadata for %s: %v\n", file.FilePath, err)
 				} else {
-					if err := s.db.UpdateFileMetadata(s.project.Name, job.filePath, string(metadataJSON)); err != nil {
-						log.Printf("\nWarning: Failed to update metadata for %s: %v\n", job.filePath, err)
+					if err := s.db.UpdateFileMetadata(s.project.Name, file.FilePath, string(metadataJSON)); err != nil {
+						log.Printf("\nWarning: Failed to update metadata for %s: %v\n", file.FilePath, err)
 					}
 				}
 
 				// Update status immediately for this file
-				if err := s.db.UpdateFileStatus(s.project.Name, job.filePath, "uploaded"); err != nil {
-					log.Printf("\nWarning: Failed to update status for %s: %v\n", job.filePath, err)
+				if err := s.db.UpdateFileStatus(s.project.Name, file.FilePath, "uploaded"); err != nil {
+					log.Printf("\nWarning: Failed to update status for %s: %v\n", file.FilePath, err)
 				}
 
-				completedFiles = append(completedFiles, job.filePath)
-				progress.Update(job.size, job.isRetry)
-				workerProgresses[id].update(job.size)
+				completedFiles = append(completedFiles, file.FilePath)
+				progress.Update(file.Size, file.UploadStatus == "failed")
+				workerProgresses[id].update(file.Size)
 				progress.Print()
 
 				// Update progress in batches
@@ -468,72 +474,26 @@ func (s *Syncer) SyncFiles() error {
 					completedFiles = nil
 				}
 			}
-		}(i)
+		}(i, startIdx, endIdx)
 	}
 
-	// Send jobs to workers
-	for _, file := range files {
-		// Ensure folder has trailing slash and construct path
-		folder := strings.TrimRight(s.project.Destination.Folder, "/") + "/"
-		destinationPath := fmt.Sprintf("%s%s", folder, file.IDFile)
-
-		// Create complete metadata
-		metadata := file.Metadata
-		if metadata == nil {
-			metadata = make(map[string]string)
-		}
-
-		// Preserve existing metadata values and set bucket without URL encoding
-		metadata["path"] = sanitizePath(file.FilePath)
-		metadata["bucket"] = fmt.Sprintf("%s/%s", s.project.Destination.Bucket, strings.TrimPrefix(destinationPath, "/"))
-		metadata["existing_id"] = file.IDFromCSV
-
-		// Sanitize destination path - replace problematic characters
-		destinationPath = strings.Map(func(r rune) rune {
-			switch r {
-			case '　': // full-width space
-				return ' ' // replace with regular space
-			case '\u200B', '\uFEFF': // zero-width space and BOM
-				return -1 // remove these characters
-			default:
-				return r
-			}
-		}, destinationPath)
-
-		// Clean the path to ensure proper formatting
-		destinationPath = strings.ReplaceAll(destinationPath, "\\", "/")
-		destinationPath = strings.TrimPrefix(destinationPath, "/")
-
-		jobs <- workItem{
-			filePath:        file.FilePath,
-			destinationPath: destinationPath,
-			size:            file.Size,
-			isRetry:         file.UploadStatus == "failed",
-			metadata:        metadata,
-		}
-	}
-
-	close(jobs)
 	wg.Wait()
-	close(results)
+	workerWg.Wait()
 
-	select {
-	case err := <-errors:
-		return err
-	default:
-		avgSpeed, _ := progress.getSpeed()
-		fmt.Printf("\nSync completed in %s:\n", time.Since(progress.startTime).Round(time.Second))
-		fmt.Printf("- Uploaded: %d files (%s) at %s average\n",
-			progress.UploadedFiles,
-			utils.FormatSize(progress.UploadedSize),
-			formatSpeed(avgSpeed))
-		fmt.Printf("- Retried: %d files (%s)\n", progress.RetryFiles, utils.FormatSize(progress.RetrySize))
-		fmt.Printf("- Skipped: %d files (%s)\n", progress.SkippedFiles, utils.FormatSize(progress.SkippedSize))
-		for _, wp := range workerProgresses {
-			wp.finish()
-		}
-		return nil
+	// Finish progress bars
+	for _, wp := range workerProgresses {
+		wp.finish()
 	}
+
+	avgSpeed, _ := progress.getSpeed()
+	fmt.Printf("\nSync completed in %s:\n", time.Since(progress.startTime).Round(time.Second))
+	fmt.Printf("- Uploaded: %d files (%s) at %s average\n",
+		progress.UploadedFiles,
+		utils.FormatSize(progress.UploadedSize),
+		formatSpeed(avgSpeed))
+	fmt.Printf("- Retried: %d files (%s)\n", progress.RetryFiles, utils.FormatSize(progress.RetrySize))
+	fmt.Printf("- Skipped: %d files (%s)\n", progress.SkippedFiles, utils.FormatSize(progress.SkippedSize))
+	return nil
 }
 
 func sanitizePath(path string) string {
@@ -555,7 +515,7 @@ func sanitizePath(path string) string {
 		segment = strings.ReplaceAll(segment, "&", "and")
 		segment = strings.ReplaceAll(segment, "+", "plus")
 
-		// Encode the segment
+		// Then encode
 		segments[i] = url.QueryEscape(segment)
 	}
 
