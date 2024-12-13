@@ -8,9 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/chmdznr/oss-local-to-minio-copier/internal/db"
-	"github.com/chmdznr/oss-local-to-minio-copier/internal/sync"
+	syncer "github.com/chmdznr/oss-local-to-minio-copier/internal/sync"
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/models"
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/utils"
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/version"
@@ -102,7 +103,7 @@ func main() {
 						Value: 100,
 					},
 				},
-				Action: startSync,
+				Action: syncFiles,
 			},
 			{
 				Name:  "status",
@@ -118,7 +119,7 @@ func main() {
 			},
 			{
 				Name:  "import",
-				Usage: "Import file list from CSV",
+				Usage: "Import files from CSV",
 				Flags: []cli.Flag{
 					&cli.StringFlag{
 						Name:     "project",
@@ -127,13 +128,18 @@ func main() {
 					},
 					&cli.StringFlag{
 						Name:     "csv",
-						Usage:    "Path to CSV file",
+						Usage:    "CSV file path",
 						Required: true,
 					},
 					&cli.IntFlag{
 						Name:  "batch",
-						Usage: "Batch size for processing",
+						Usage: "Batch size for processing records (default: 1000)",
 						Value: 1000,
+					},
+					&cli.IntFlag{
+						Name:  "workers",
+						Usage: "Number of concurrent workers (default: 8)",
+						Value: 8,
 					},
 				},
 				Action: importCSV,
@@ -191,39 +197,34 @@ func createProject(c *cli.Context) error {
 	return nil
 }
 
-func startSync(c *cli.Context) error {
+func syncFiles(c *cli.Context) error {
 	projectName := c.String("project")
 	if projectName == "" {
 		return fmt.Errorf("project name is required")
 	}
 
+	// Open database connection
 	db, err := db.New(projectName)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %v", err)
 	}
 	defer db.Close()
 
+	// Get project details
 	project, err := db.GetProject(projectName)
 	if err != nil {
-		return fmt.Errorf("failed to get project: %v", err)
+		return fmt.Errorf("failed to get project details: %v", err)
 	}
 
-	syncerConfig := sync.SyncerConfig{
-		NumWorkers: c.Int("workers"),
-		BatchSize:  c.Int("batch"),
-	}
-
-	syncer, err := sync.NewSyncer(db, project, &syncerConfig)
+	// Create syncer with default config
+	defaultConfig := syncer.DefaultSyncerConfig()
+	s, err := syncer.NewSyncer(db, project, &defaultConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create syncer: %v", err)
 	}
 
-	if err := syncer.SyncFiles(); err != nil {
-		return fmt.Errorf("failed to sync files: %v", err)
-	}
-
-	fmt.Println("Sync completed successfully")
-	return nil
+	// Start sync process
+	return s.SyncFiles()
 }
 
 // showStatus shows the status of the project
@@ -299,6 +300,7 @@ func importCSV(c *cli.Context) error {
 	projectName := c.String("project")
 	csvPath := c.String("csv")
 	batchSize := c.Int("batch")
+	numWorkers := c.Int("workers")
 
 	if projectName == "" {
 		return fmt.Errorf("project name is required")
@@ -308,6 +310,9 @@ func importCSV(c *cli.Context) error {
 	}
 	if batchSize <= 0 {
 		batchSize = 1000 // default batch size
+	}
+	if numWorkers <= 0 {
+		numWorkers = 8 // default number of workers
 	}
 
 	// Open database connection
@@ -359,11 +364,26 @@ func importCSV(c *cli.Context) error {
 		}
 	}
 
-	// Process records in batches
-	var records []models.CSVRecord
-	recordCount := 0
-	skippedCount := 0
-	var totalSize int64
+	// Count total rows for distribution
+	totalRows := 0
+	countFile, err := os.Open(csvPath)
+	if err != nil {
+		return fmt.Errorf("failed to open CSV file for counting: %v", err)
+	}
+	countReader := csv.NewReader(countFile)
+	for {
+		_, err := countReader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			countFile.Close()
+			return fmt.Errorf("failed to count CSV rows: %v", err)
+		}
+		totalRows++
+	}
+	countFile.Close()
+	totalRows-- // Subtract header row
 
 	// Get existing files to track updates
 	existingFiles, err := db.GetProjectFiles(projectName)
@@ -374,92 +394,233 @@ func importCSV(c *cli.Context) error {
 	for _, f := range existingFiles {
 		existingFilesMap[f.FilePath] = true
 	}
-	updatedCount := 0
 
-	fmt.Println("Starting import process...")
-	fmt.Println("Checking files and collecting sizes...")
+	// Create channels for worker pool
+	type workResult struct {
+		newCount     int
+		updateCount  int
+		skipCount    int
+		totalSize    int64
+		records      []models.CSVRecord
+		err          error
+	}
 
-	lineNum := 2 // Start from 2 to account for header row
-	for {
-		row, err := reader.Read()
-		if err == io.EOF {
+	jobs := make(chan int, numWorkers)
+	results := make(chan workResult, numWorkers)
+	dbMutex := &sync.Mutex{} // Mutex for database operations
+
+	// Calculate rows per worker and remainder
+	rowsPerWorker := totalRows / numWorkers
+	remainderRows := totalRows % numWorkers
+
+	if rowsPerWorker < batchSize {
+		// If we have fewer rows than batch size * workers, adjust workers down
+		numWorkers = (totalRows + batchSize - 1) / batchSize
+		rowsPerWorker = totalRows / numWorkers
+		remainderRows = totalRows % numWorkers
+	}
+
+	fmt.Printf("Starting import with %d workers, processing %d rows (base rows per worker: %d, remainder: %d)...\n", 
+		numWorkers, totalRows, rowsPerWorker, remainderRows)
+
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+
+			workerFile, err := os.Open(csvPath)
+			if err != nil {
+				results <- workResult{err: fmt.Errorf("worker %d failed to open CSV: %v", workerID, err)}
+				return
+			}
+			defer workerFile.Close()
+
+			workerReader := csv.NewReader(workerFile)
+			workerReader.FieldsPerRecord = -1
+
+			// Skip header
+			_, err = workerReader.Read()
+			if err != nil {
+				results <- workResult{err: fmt.Errorf("worker %d failed to read header: %v", workerID, err)}
+				return
+			}
+
+			var records []models.CSVRecord
+			result := workResult{}
+
+			for startRow := range jobs {
+				// Calculate this worker's actual row range
+				extraRow := 0
+				if workerID < remainderRows {
+					extraRow = 1
+				}
+				endRow := startRow + rowsPerWorker + extraRow - 1
+				if endRow > totalRows {
+					endRow = totalRows
+				}
+
+				log.Printf("Worker %d processing rows %d to %d", workerID, startRow, endRow)
+
+				// Skip to start row
+				for i := 1; i < startRow; i++ {
+					if _, err := workerReader.Read(); err != nil {
+						results <- workResult{err: fmt.Errorf("worker %d failed to skip to start: %v", workerID, err)}
+						return
+					}
+				}
+
+				// Process assigned rows
+				for currentRow := startRow; currentRow <= endRow; currentRow++ {
+					row, err := workerReader.Read()
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						results <- workResult{err: fmt.Errorf("worker %d failed to read row: %v", workerID, err)}
+						return
+					}
+
+					filePath := row[headerMap["path"]]
+					idUpload := row[headerMap["id_upload"]]
+					fullPath := filepath.Join(project.SourcePath, filePath)
+
+					// Check if file exists and get its info
+					fileInfo, err := os.Stat(fullPath)
+					if err != nil {
+						if os.IsNotExist(err) {
+							result.skipCount++
+							dbMutex.Lock()
+							if err := db.AddMissingFile(fullPath, idUpload, currentRow+2); err != nil {
+								log.Printf("Error recording missing file: %v", err)
+							}
+							dbMutex.Unlock()
+							continue
+						}
+						results <- workResult{err: fmt.Errorf("failed to get file info for %s: %v", filePath, err)}
+						return
+					}
+
+					// Skip directories
+					if fileInfo.IsDir() {
+						result.skipCount++
+						continue
+					}
+
+					record := models.CSVRecord{
+						IDUpload:     idUpload,
+						Path:         filePath,
+						NamaModul:    row[headerMap["nama_modul"]],
+						FileType:     row[headerMap["file_type"]],
+						NamaFileAsli: row[headerMap["nama_file_asli"]],
+						IDProfile:    row[headerMap["id_profile"]],
+						ID:           row[headerMap["id"]],
+						StrKey:       row[headerMap["str_key"]],
+						StrSubKey:    row[headerMap["str_subkey"]],
+						Size:         fileInfo.Size(),
+						ModTime:      fileInfo.ModTime().Unix(),
+					}
+
+					records = append(records, record)
+					result.totalSize += fileInfo.Size()
+
+					if existingFilesMap[filePath] {
+						result.updateCount++
+					} else {
+						result.newCount++
+					}
+
+					if len(records) >= batchSize {
+						dbMutex.Lock()
+						if err := db.SaveFileRecordsFromCSVBatch(projectName, records); err != nil {
+							dbMutex.Unlock()
+							results <- workResult{err: fmt.Errorf("worker %d failed to save batch: %v", workerID, err)}
+							return
+						}
+						dbMutex.Unlock()
+						records = records[:0]
+					}
+				}
+			}
+
+			// Save any remaining records
 			if len(records) > 0 {
-				if err := db.SaveFileRecordsFromCSVBatch(projectName, records); err != nil {
-					return fmt.Errorf("failed to save batch: %v", err)
-				}
+				result.records = records
 			}
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("failed to read CSV row: %v", err)
-		}
 
-		filePath := row[headerMap["path"]]
-		idUpload := row[headerMap["id_upload"]]
-		fullPath := filepath.Join(project.SourcePath, filePath)
+			results <- result
+		}(i)
+	}
 
-		// Check if file exists and get its info
-		fileInfo, err := os.Stat(fullPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				skippedCount++
-				if err := db.AddMissingFile(fullPath, idUpload, lineNum); err != nil {
-					log.Printf("Error recording missing file: %v", err)
-				}
-				lineNum++
-				continue
+	// Distribute work to workers
+	go func() {
+		currentRow := 1
+		for workerID := 0; workerID < numWorkers; workerID++ {
+			// Calculate this worker's row count
+			extraRow := 0
+			if workerID < remainderRows {
+				extraRow = 1
 			}
-			return fmt.Errorf("failed to get file info for %s: %v", filePath, err)
+			workerRows := rowsPerWorker + extraRow
+			
+			endRow := currentRow + workerRows - 1
+			if endRow > totalRows {
+				endRow = totalRows
+			}
+			
+			log.Printf("Assigning rows %d to %d to worker %d", currentRow, endRow, workerID)
+			jobs <- currentRow
+			currentRow += workerRows
 		}
+		close(jobs)
+	}()
 
-		// Skip directories
-		if fileInfo.IsDir() {
-			skippedCount++
-			lineNum++
+	// Wait for all workers and collect results
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Process results
+	var totalNewFiles, totalUpdatedFiles, totalSkippedFiles int
+	var totalFileSize int64
+	var firstError error
+	var remainingRecords []models.CSVRecord
+
+	for result := range results {
+		if result.err != nil {
+			if firstError == nil {
+				firstError = result.err
+			}
 			continue
 		}
-
-		record := models.CSVRecord{
-			IDUpload:     idUpload,
-			Path:         filePath,
-			NamaModul:    row[headerMap["nama_modul"]],
-			FileType:     row[headerMap["file_type"]],
-			NamaFileAsli: row[headerMap["nama_file_asli"]],
-			IDProfile:    row[headerMap["id_profile"]],
-			ID:           row[headerMap["id"]],
-			StrKey:       row[headerMap["str_key"]],
-			StrSubKey:    row[headerMap["str_subkey"]],
-			Size:         fileInfo.Size(),
-			ModTime:      fileInfo.ModTime().Unix(), // Add file modification time
+		totalNewFiles += result.newCount
+		totalUpdatedFiles += result.updateCount
+		totalSkippedFiles += result.skipCount
+		totalFileSize += result.totalSize
+		if len(result.records) > 0 {
+			remainingRecords = append(remainingRecords, result.records...)
 		}
+	}
 
-		records = append(records, record)
-		if existingFilesMap[filePath] {
-			updatedCount++
-		} else {
-			recordCount++
-		}
-		totalSize += fileInfo.Size()
-
-		if len(records) >= batchSize {
-			if err := db.SaveFileRecordsFromCSVBatch(projectName, records); err != nil {
-				return fmt.Errorf("failed to save batch: %v", err)
+	// Save any remaining records from all workers
+	if len(remainingRecords) > 0 && firstError == nil {
+		if err := db.SaveFileRecordsFromCSVBatch(projectName, remainingRecords); err != nil {
+			if firstError == nil {
+				firstError = fmt.Errorf("failed to save final batch: %v", err)
 			}
-			records = records[:0]
-			fmt.Printf("\rProcessed %d new files, updated %d files (%s), skipped %d files",
-				recordCount,
-				updatedCount,
-				utils.FormatSize(totalSize),
-				skippedCount,
-			)
 		}
-		lineNum++
+	}
+
+	if firstError != nil {
+		return fmt.Errorf("import failed: %v", firstError)
 	}
 
 	fmt.Printf("\nImport completed:\n")
-	fmt.Printf("- New files imported: %d\n", recordCount)
-	fmt.Printf("- Existing files updated: %d\n", updatedCount)
-	fmt.Printf("- Total size: %s\n", utils.FormatSize(totalSize))
-	fmt.Printf("- Skipped: %d files\n", skippedCount)
+	fmt.Printf("- New files imported: %d\n", totalNewFiles)
+	fmt.Printf("- Existing files updated: %d\n", totalUpdatedFiles)
+	fmt.Printf("- Total size: %s\n", utils.FormatSize(totalFileSize))
+	fmt.Printf("- Skipped: %d files\n", totalSkippedFiles)
 	return nil
 }

@@ -21,13 +21,19 @@ type DB struct {
 func New(projectName string) (*DB, error) {
 	fmt.Printf("Initializing database for project: %s\n", projectName)
 	dbPath := fmt.Sprintf("%s.db", projectName)
-	sqlDB, err := sql.Open("sqlite3", dbPath)
+	sqlDB, err := sql.Open("sqlite3", dbPath+"?_journal=WAL&_timeout=5000&_busy_timeout=5000")
 	if err != nil {
 		return nil, err
 	}
 
+	// Set connection pool settings
+	sqlDB.SetMaxOpenConns(1)  // Limit to one connection to prevent "database is locked" errors
+	sqlDB.SetMaxIdleConns(1)
+	sqlDB.SetConnMaxLifetime(time.Hour)
+
 	db := &DB{sqlDB}
 	if err := db.initialize(); err != nil {
+		sqlDB.Close()
 		return nil, err
 	}
 
