@@ -469,7 +469,7 @@ func importCSV(c *cli.Context) error {
 				fileInfo, err := os.Stat(filepath.Join(project.SourcePath, filePath))
 				if err != nil {
 					if os.IsNotExist(err) {
-						log.Printf("Warning: File not found: %s", filePath)
+						result.skipCount++
 						continue
 					}
 					results <- workResult{err: fmt.Errorf("worker %d failed to stat file: %v", workerID, err)}
