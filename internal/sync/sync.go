@@ -21,6 +21,7 @@ import (
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/utils"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/cheggaaa/pb/v3"
 )
 
 // Syncer handles file synchronization operations
@@ -44,6 +45,43 @@ func DefaultSyncerConfig() SyncerConfig {
 		NumWorkers: 16,
 		BatchSize:  100,
 	}
+}
+
+// workerProgress tracks progress for a single worker
+type workerProgress struct {
+	id             int
+	totalFiles     int64
+	totalSize      int64
+	processedFiles int64
+	processedSize  int64
+	bar           *pb.ProgressBar
+}
+
+func newWorkerProgress(id int, totalFiles, totalSize int64) *workerProgress {
+	bar := pb.New64(totalFiles)
+	bar.Set(pb.Bytes, true)
+	bar.SetTemplate(`Worker {{string . "id"}} {{counters . }} {{bar . }} {{percent . }} {{speed . }}`)
+	bar.Set("id", fmt.Sprintf("%d", id))
+	return &workerProgress{
+		id:         id,
+		totalFiles: totalFiles,
+		totalSize:  totalSize,
+		bar:        bar,
+	}
+}
+
+func (wp *workerProgress) update(size int64) {
+	wp.processedFiles++
+	wp.processedSize += size
+	wp.bar.Increment()
+}
+
+func (wp *workerProgress) start() {
+	wp.bar.Start()
+}
+
+func (wp *workerProgress) finish() {
+	wp.bar.Finish()
 }
 
 // NewSyncer creates a new syncer instance
@@ -281,9 +319,12 @@ func (s *Syncer) SyncFiles() error {
 
 	// Start workers
 	var wg sync.WaitGroup
+	workerProgresses := make([]*workerProgress, s.numWorkers)
 	for i := 0; i < s.numWorkers; i++ {
 		wg.Add(1)
-		go func() {
+		workerProgresses[i] = newWorkerProgress(i, progress.TotalFiles, progress.TotalSize)
+		workerProgresses[i].start()
+		go func(id int) {
 			defer wg.Done()
 			var completedFiles []string
 
@@ -405,6 +446,7 @@ func (s *Syncer) SyncFiles() error {
 
 				completedFiles = append(completedFiles, job.filePath)
 				progress.Update(job.size, job.isRetry)
+				workerProgresses[id].update(job.size)
 				progress.Print()
 
 				// Update progress in batches
@@ -412,7 +454,7 @@ func (s *Syncer) SyncFiles() error {
 					completedFiles = nil
 				}
 			}
-		}()
+		}(i)
 	}
 
 	// Send jobs to workers
@@ -473,6 +515,9 @@ func (s *Syncer) SyncFiles() error {
 			formatSpeed(avgSpeed))
 		fmt.Printf("- Retried: %d files (%s)\n", progress.RetryFiles, utils.FormatSize(progress.RetrySize))
 		fmt.Printf("- Skipped: %d files (%s)\n", progress.SkippedFiles, utils.FormatSize(progress.SkippedSize))
+		for _, wp := range workerProgresses {
+			wp.finish()
+		}
 		return nil
 	}
 }
