@@ -10,4 +10,5 @@ type Stats struct {
 	PendingSize   int64
 	FailedFiles   int64
 	FailedSize    int64
+	MissingFiles  int64 // New field for missing files count
 }

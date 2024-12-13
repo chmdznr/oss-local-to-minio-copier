@@ -260,6 +260,7 @@ func showStatus(c *cli.Context) error {
 	fmt.Printf("Files Uploaded: %d (Size: %s)\n", stats.UploadedFiles, utils.FormatSize(stats.UploadedSize))
 	fmt.Printf("Files Pending: %d (Size: %s)\n", stats.PendingFiles, utils.FormatSize(stats.PendingSize))
 	fmt.Printf("Files Failed: %d (Size: %s)\n", stats.FailedFiles, utils.FormatSize(stats.FailedSize))
+	fmt.Printf("Files Missing: %d\n", stats.MissingFiles)
 
 	var fileProgress, sizeProgress float64
 	if stats.TotalFiles > 0 {

@@ -320,33 +320,59 @@ func (db *DB) GetFileStats(projectName string) (totalFiles, totalSize, uploadedF
 
 // GetStats returns statistics about files in the project
 func (db *DB) GetStats(projectName string) (*models.Stats, error) {
-	var stats models.Stats
+	stats := &models.Stats{}
+
+	// Get total files and size
 	err := db.QueryRow(`
-		SELECT 
-			COUNT(*) as total_files,
-			COALESCE(SUM(file_size), 0) as total_size,
-			COUNT(CASE WHEN status = 'uploaded' THEN 1 END) as uploaded_files,
-			COALESCE(SUM(CASE WHEN status = 'uploaded' THEN file_size ELSE 0 END), 0) as uploaded_size,
-			COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_files,
-			COALESCE(SUM(CASE WHEN status = 'pending' THEN file_size ELSE 0 END), 0) as pending_size,
-			COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_files,
-			COALESCE(SUM(CASE WHEN status = 'failed' THEN file_size ELSE 0 END), 0) as failed_size
-		FROM files 
+		SELECT COUNT(*), COALESCE(SUM(size), 0)
+		FROM files
 		WHERE project_name = ?
-	`, projectName).Scan(
-		&stats.TotalFiles,
-		&stats.TotalSize,
-		&stats.UploadedFiles,
-		&stats.UploadedSize,
-		&stats.PendingFiles,
-		&stats.PendingSize,
-		&stats.FailedFiles,
-		&stats.FailedSize,
-	)
+	`, projectName).Scan(&stats.TotalFiles, &stats.TotalSize)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get stats: %v", err)
+		return nil, fmt.Errorf("failed to get total stats: %v", err)
 	}
-	return &stats, nil
+
+	// Get uploaded files and size
+	err = db.QueryRow(`
+		SELECT COUNT(*), COALESCE(SUM(size), 0)
+		FROM files
+		WHERE project_name = ? AND status = 'uploaded'
+	`, projectName).Scan(&stats.UploadedFiles, &stats.UploadedSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get uploaded stats: %v", err)
+	}
+
+	// Get pending files and size
+	err = db.QueryRow(`
+		SELECT COUNT(*), COALESCE(SUM(size), 0)
+		FROM files
+		WHERE project_name = ? AND status = 'pending'
+	`, projectName).Scan(&stats.PendingFiles, &stats.PendingSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pending stats: %v", err)
+	}
+
+	// Get failed files and size
+	err = db.QueryRow(`
+		SELECT COUNT(*), COALESCE(SUM(size), 0)
+		FROM files
+		WHERE project_name = ? AND status = 'failed'
+	`, projectName).Scan(&stats.FailedFiles, &stats.FailedSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get failed stats: %v", err)
+	}
+
+	// Get missing files count
+	err = db.QueryRow(`
+		SELECT COUNT(*)
+		FROM missing_files
+		WHERE project_name = ?
+	`, projectName).Scan(&stats.MissingFiles)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get missing files count: %v", err)
+	}
+
+	return stats, nil
 }
 
 // GetFileByPath retrieves a file record by its path
