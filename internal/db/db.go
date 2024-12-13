@@ -27,7 +27,7 @@ func New(projectName string) (*DB, error) {
 	}
 
 	// Set connection pool settings
-	sqlDB.SetMaxOpenConns(1)  // Limit to one connection to prevent "database is locked" errors
+	sqlDB.SetMaxOpenConns(1) // Limit to one connection to prevent "database is locked" errors
 	sqlDB.SetMaxIdleConns(1)
 	sqlDB.SetConnMaxLifetime(time.Hour)
 
@@ -324,7 +324,7 @@ func (db *DB) GetStats(projectName string) (*models.Stats, error) {
 
 	// Get total files and size
 	err := db.QueryRow(`
-		SELECT COUNT(*), COALESCE(SUM(size), 0)
+		SELECT COUNT(*), COALESCE(SUM(file_size), 0)
 		FROM files
 		WHERE project_name = ?
 	`, projectName).Scan(&stats.TotalFiles, &stats.TotalSize)
@@ -334,7 +334,7 @@ func (db *DB) GetStats(projectName string) (*models.Stats, error) {
 
 	// Get uploaded files and size
 	err = db.QueryRow(`
-		SELECT COUNT(*), COALESCE(SUM(size), 0)
+		SELECT COUNT(*), COALESCE(SUM(file_size), 0)
 		FROM files
 		WHERE project_name = ? AND status = 'uploaded'
 	`, projectName).Scan(&stats.UploadedFiles, &stats.UploadedSize)
@@ -344,7 +344,7 @@ func (db *DB) GetStats(projectName string) (*models.Stats, error) {
 
 	// Get pending files and size
 	err = db.QueryRow(`
-		SELECT COUNT(*), COALESCE(SUM(size), 0)
+		SELECT COUNT(*), COALESCE(SUM(file_size), 0)
 		FROM files
 		WHERE project_name = ? AND status = 'pending'
 	`, projectName).Scan(&stats.PendingFiles, &stats.PendingSize)
@@ -354,7 +354,7 @@ func (db *DB) GetStats(projectName string) (*models.Stats, error) {
 
 	// Get failed files and size
 	err = db.QueryRow(`
-		SELECT COUNT(*), COALESCE(SUM(size), 0)
+		SELECT COUNT(*), COALESCE(SUM(file_size), 0)
 		FROM files
 		WHERE project_name = ? AND status = 'failed'
 	`, projectName).Scan(&stats.FailedFiles, &stats.FailedSize)
@@ -366,8 +366,7 @@ func (db *DB) GetStats(projectName string) (*models.Stats, error) {
 	err = db.QueryRow(`
 		SELECT COUNT(*)
 		FROM missing_files
-		WHERE project_name = ?
-	`, projectName).Scan(&stats.MissingFiles)
+	`).Scan(&stats.MissingFiles)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get missing files count: %v", err)
 	}
@@ -424,17 +423,17 @@ func (db *DB) SaveFileRecordFromCSV(projectName string, csvRecord *models.CSVRec
 			str_subkey = excluded.str_subkey
 	`,
 		projectName,
-		csvRecord.IDUpload,   // id_file
-		csvRecord.StrKey,     // id_permohonan
-		time.Now().Format(time.RFC3339),           // timestamp
-		csvRecord.Path,       // filepath
-		"pending",            // status
-		"",                   // bucketpath (to be set during upload)
-		string(metadataJSON), // f_metadata
-		"migrator",           // userid
-		time.Now().Format(time.RFC3339),           // created_at
-		csvRecord.StrKey,     // str_key
-		csvRecord.StrSubKey,  // str_subkey
+		csvRecord.IDUpload,              // id_file
+		csvRecord.StrKey,                // id_permohonan
+		time.Now().Format(time.RFC3339), // timestamp
+		csvRecord.Path,                  // filepath
+		"pending",                       // status
+		"",                              // bucketpath (to be set during upload)
+		string(metadataJSON),            // f_metadata
+		"migrator",                      // userid
+		time.Now().Format(time.RFC3339), // created_at
+		csvRecord.StrKey,                // str_key
+		csvRecord.StrSubKey,             // str_subkey
 	)
 
 	return err
@@ -521,7 +520,7 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 					}
 				}
 			}
-			
+
 			recordModTime := time.Unix(record.ModTime, 0)
 			if existingSize == record.Size && existingTimestamp.Equal(recordModTime) {
 				status = existingStatus // preserve existing status if file hasn't changed
@@ -533,26 +532,26 @@ func (db *DB) SaveFileRecordsFromCSVBatch(projectName string, records []models.C
 		}
 
 		// Convert ModTime to string format for database
-		modTimeStr := fmt.Sprintf("%d", record.ModTime)  // Store as Unix timestamp string
+		modTimeStr := fmt.Sprintf("%d", record.ModTime) // Store as Unix timestamp string
 
 		// Do the insert/update with determined status
 		_, err = insertStmt.Exec(
 			projectName,
-			record.IDUpload,      // id_file
-			record.ID,            // id_permohonan
-			record.ID,            // id_from_csv
-			record.Path,          // filepath
-			record.Size,          // file_size
-			record.FileType,      // file_type
-			"",                   // bucketpath (to be set during upload)
-			string(metadataJSON), // f_metadata
-			"migrator",           // userid
+			record.IDUpload,          // id_file
+			record.ID,                // id_permohonan
+			record.ID,                // id_from_csv
+			record.Path,              // filepath
+			record.Size,              // file_size
+			record.FileType,          // file_type
+			"",                       // bucketpath (to be set during upload)
+			string(metadataJSON),     // f_metadata
+			"migrator",               // userid
 			now.Format(time.RFC3339), // created_at
-			record.StrKey,        // str_key
-			record.StrSubKey,     // str_subkey
-			modTimeStr,           // timestamp - store as string
-			status,               // determined status
-			status,               // status for ON CONFLICT UPDATE
+			record.StrKey,            // str_key
+			record.StrSubKey,         // str_subkey
+			modTimeStr,               // timestamp - store as string
+			status,                   // determined status
+			status,                   // status for ON CONFLICT UPDATE
 		)
 		if err != nil {
 			return fmt.Errorf("failed to insert/update record: %v", err)
