@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/models"
@@ -250,6 +251,25 @@ func (db *DB) UpdateFileStatusBatch(projectName string, filePaths []string, stat
 	}
 
 	return tx.Commit()
+}
+
+// UpdateFilesStatus updates the status of multiple files in a batch
+func (db *DB) UpdateFilesStatus(project string, filePaths []string, status string) error {
+	// First check if any files exist
+	if len(filePaths) == 0 {
+		return nil
+	}
+
+	query := `UPDATE files SET status = ?, timestamp = ? WHERE project_name = ? AND filepath IN (?` + strings.Repeat(",?", len(filePaths)-1) + `)`
+	args := make([]interface{}, len(filePaths)+3)
+	args[0] = status
+	args[1] = time.Now().Format(time.RFC3339)
+	args[2] = project
+	for i, path := range filePaths {
+		args[i+3] = path
+	}
+	_, err := db.Exec(query, args...)
+	return err
 }
 
 // SaveFileRecord saves a file record
