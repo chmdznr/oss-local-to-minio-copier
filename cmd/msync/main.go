@@ -277,6 +277,11 @@ func showStatus(c *cli.Context) error {
 	return nil
 }
 
+type csvRow struct {
+	data     []string
+	lineNum  int // 1-based line number in original CSV
+}
+
 // importCSV imports file records from a CSV file to the database
 //
 // The CSV file must contain the following columns:
@@ -442,9 +447,9 @@ func importCSV(c *cli.Context) error {
 	defer pool.Stop()
 
 	// Create channels for each worker
-	workerChannels := make([]chan []string, numWorkers)
+	workerChannels := make([]chan csvRow, numWorkers)
 	for i := range workerChannels {
-		workerChannels[i] = make(chan []string, numWorkers)
+		workerChannels[i] = make(chan csvRow, numWorkers)
 	}
 
 	// Start workers
@@ -464,7 +469,7 @@ func importCSV(c *cli.Context) error {
 			// Process rows sent to this worker
 			for row := range workerChannels[workerID] {
 				rowCount++
-				filePath := row[headerMap["path"]]
+				filePath := row.data[headerMap["path"]]
 				if filePath == "" {
 					continue
 				}
@@ -474,24 +479,29 @@ func importCSV(c *cli.Context) error {
 				if err != nil {
 					if os.IsNotExist(err) {
 						result.skipCount++
+						dbMutex.Lock()
+						if err := db.AddMissingFile(filePath, row.data[headerMap["id_upload"]], row.lineNum); err != nil {
+							log.Printf("Warning: Failed to record missing file %s: %v", filePath, err)
+						}
+						dbMutex.Unlock()
 						continue
 					}
 					results <- workResult{err: fmt.Errorf("worker %d failed to stat file: %v", workerID, err)}
 					return
 				}
 
-				idUpload := row[headerMap["id_upload"]]
+				idUpload := row.data[headerMap["id_upload"]]
 
 				record := models.CSVRecord{
 					IDUpload:     idUpload,
 					Path:         filePath,
-					NamaModul:    row[headerMap["nama_modul"]],
-					FileType:     row[headerMap["file_type"]],
-					NamaFileAsli: row[headerMap["nama_file_asli"]],
-					IDProfile:    row[headerMap["id_profile"]],
-					ID:           row[headerMap["id"]],
-					StrKey:       row[headerMap["str_key"]],
-					StrSubKey:    row[headerMap["str_subkey"]],
+					NamaModul:    row.data[headerMap["nama_modul"]],
+					FileType:     row.data[headerMap["file_type"]],
+					NamaFileAsli: row.data[headerMap["nama_file_asli"]],
+					IDProfile:    row.data[headerMap["id_profile"]],
+					ID:           row.data[headerMap["id"]],
+					StrKey:       row.data[headerMap["str_key"]],
+					StrSubKey:    row.data[headerMap["str_subkey"]],
 					Size:         fileInfo.Size(),
 					ModTime:      fileInfo.ModTime().Unix(),
 				}
@@ -532,6 +542,7 @@ func importCSV(c *cli.Context) error {
 	go func() {
 		currentWorker := 0
 		rowsDistributed := make([]int, numWorkers)
+		lineNum := 1 // Start from 1 since we already read header
 
 		for {
 			row, err := reader.Read()
@@ -542,13 +553,14 @@ func importCSV(c *cli.Context) error {
 				log.Printf("Error reading row: %v", err)
 				continue
 			}
+			lineNum++ // Increment for each row read
 
 			// Find next worker that hasn't reached its quota
 			for rowsDistributed[currentWorker] >= workerRowCounts[currentWorker] {
 				currentWorker = (currentWorker + 1) % numWorkers
 			}
 
-			workerChannels[currentWorker] <- row
+			workerChannels[currentWorker] <- csvRow{data: row, lineNum: lineNum}
 			rowsDistributed[currentWorker]++
 			currentWorker = (currentWorker + 1) % numWorkers
 		}

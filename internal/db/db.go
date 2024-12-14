@@ -384,7 +384,7 @@ func (db *DB) GetStats(projectName string) (*models.Stats, error) {
 
 	// Get missing files count
 	err = db.QueryRow(`
-		SELECT COUNT(*)
+		SELECT COUNT(DISTINCT id_upload)
 		FROM missing_files
 	`).Scan(&stats.MissingFiles)
 	if err != nil {
@@ -655,7 +655,7 @@ type MissingFile struct {
 
 // AddMissingFile adds a record of a missing file
 func (db *DB) AddMissingFile(filePath string, idUpload string, csvLine int) error {
-	query := `INSERT INTO missing_files (filepath, id_upload, csv_line) VALUES (?, ?, ?)`
+	query := `INSERT OR IGNORE INTO missing_files (filepath, id_upload, csv_line) VALUES (?, ?, ?)`
 	_, err := db.Exec(query, filePath, idUpload, csvLine)
 	return err
 }
@@ -663,7 +663,7 @@ func (db *DB) AddMissingFile(filePath string, idUpload string, csvLine int) erro
 // GetMissingFilesCount returns the total number of missing files
 func (db *DB) GetMissingFilesCount() (int, error) {
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM missing_files").Scan(&count)
+	err := db.QueryRow("SELECT COUNT(DISTINCT id_upload) FROM missing_files").Scan(&count)
 	return count, err
 }
 
