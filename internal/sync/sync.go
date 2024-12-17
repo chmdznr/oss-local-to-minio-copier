@@ -20,6 +20,8 @@ import (
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/utils"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/eiannone/keyboard"
+	"os/signal"
 )
 
 // Syncer handles file synchronization operations
@@ -29,6 +31,8 @@ type Syncer struct {
 	minioClient *minio.Client
 	numWorkers  int
 	batchSize   int
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 // SyncerConfig holds configuration for the syncer
@@ -220,7 +224,7 @@ func (s *Syncer) uploadFile(file models.FileRecord) error {
 
 	// Upload the file with metadata
 	_, err = s.minioClient.PutObject(
-		context.Background(),
+		s.ctx,
 		s.project.Destination.Bucket,
 		file.IDFile,
 		localFile,
@@ -240,120 +244,124 @@ func (s *Syncer) uploadFile(file models.FileRecord) error {
 func (s *Syncer) processWorkerFiles(id int, files []models.FileRecord, startIdx, endIdx int, progress *syncProgress, workerProgress *workerProgress) {
 	var completedFiles []string
 
-	// Start the worker progress bar
 	workerProgress.start()
+	defer workerProgress.finish()
 
-	// Process only files assigned to this worker
-	for j := startIdx; j < endIdx && j < len(files); j++ {
-		file := files[j]
-		// Ensure folder has trailing slash and construct path
-		folder := strings.TrimRight(s.project.Destination.Folder, "/") + "/"
-		destinationPath := fmt.Sprintf("%s%s", folder, file.IDFile)
+	for i := startIdx; i < endIdx && i < len(files); i++ {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+			file := files[i]
+			// Ensure folder has trailing slash and construct path
+			folder := strings.TrimRight(s.project.Destination.Folder, "/") + "/"
+			destinationPath := fmt.Sprintf("%s%s", folder, file.IDFile)
 
-		// Create complete metadata
-		metadata := file.Metadata
-		if metadata == nil {
-			metadata = make(map[string]string)
-		}
-
-		// Preserve existing metadata values and set bucket without URL encoding
-		metadata["path"] = sanitizePath(file.FilePath)
-		metadata["bucket"] = fmt.Sprintf("%s/%s", s.project.Destination.Bucket, strings.TrimPrefix(destinationPath, "/"))
-		metadata["existing_id"] = file.IDFromCSV
-
-		fullPath := filepath.Join(s.project.SourcePath, file.FilePath)
-
-		// Check if file still exists
-		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-			log.Printf("\nSkipping %s: file no longer exists\n", file.FilePath)
-			progress.Skip(file.Size)
-			progress.updateBar()
-
-			// Mark as skipped in database
-			if err := s.db.UpdateFileStatus(s.project.Name, file.FilePath, "skipped"); err != nil {
-				log.Printf("\nFailed to update status for %s: %v\n", file.FilePath, err)
+			// Create complete metadata
+			metadata := file.Metadata
+			if metadata == nil {
+				metadata = make(map[string]string)
 			}
-			continue
-		}
 
-		// Set metadata if available
-		var opts minio.PutObjectOptions
-		if metadata != nil {
-			// Sanitize metadata values and handle special cases
-			sanitizedMetadata := make(map[string]string)
-			for k, v := range metadata {
-				sanitized := v
-				if k == "path" {
-					// Special handling for path metadata
-					sanitized = sanitizePath(v)
-				} else if k == "bucket" {
-					// Special handling for bucket metadata - don't URL encode
-					sanitized = v
-				} else {
-					// For other metadata values, first decode if already encoded
-					decoded, err := url.QueryUnescape(v)
-					if err == nil {
-						sanitized = decoded
+			// Preserve existing metadata values and set bucket without URL encoding
+			metadata["path"] = sanitizePath(file.FilePath)
+			metadata["bucket"] = fmt.Sprintf("%s/%s", s.project.Destination.Bucket, strings.TrimPrefix(destinationPath, "/"))
+			metadata["existing_id"] = file.IDFromCSV
+
+			fullPath := filepath.Join(s.project.SourcePath, file.FilePath)
+
+			// Check if file still exists
+			if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+				log.Printf("\nSkipping %s: file no longer exists\n", file.FilePath)
+				progress.Skip(file.Size)
+				progress.updateBar()
+
+				// Mark as skipped in database
+				if err := s.db.UpdateFileStatus(s.project.Name, file.FilePath, "skipped"); err != nil {
+					log.Printf("\nFailed to update status for %s: %v\n", file.FilePath, err)
+				}
+				continue
+			}
+
+			// Set metadata if available
+			var opts minio.PutObjectOptions
+			if metadata != nil {
+				// Sanitize metadata values and handle special cases
+				sanitizedMetadata := make(map[string]string)
+				for k, v := range metadata {
+					sanitized := v
+					if k == "path" {
+						// Special handling for path metadata
+						sanitized = sanitizePath(v)
+					} else if k == "bucket" {
+						// Special handling for bucket metadata - don't URL encode
+						sanitized = v
+					} else {
+						// For other metadata values, first decode if already encoded
+						decoded, err := url.QueryUnescape(v)
+						if err == nil {
+							sanitized = decoded
+						}
+						// Replace problematic characters
+						sanitized = strings.ReplaceAll(sanitized, "&", "and")
+						sanitized = strings.ReplaceAll(sanitized, "+", "plus")
+						// Then encode
+						sanitized = url.QueryEscape(sanitized)
 					}
-					// Replace problematic characters
-					sanitized = strings.ReplaceAll(sanitized, "&", "and")
-					sanitized = strings.ReplaceAll(sanitized, "+", "plus")
-					// Then encode
-					sanitized = url.QueryEscape(sanitized)
+					sanitized = strings.TrimSpace(sanitized)
+					if sanitized != "" {
+						sanitizedMetadata[k] = sanitized
+					}
 				}
-				sanitized = strings.TrimSpace(sanitized)
-				if sanitized != "" {
-					sanitizedMetadata[k] = sanitized
+				opts.UserMetadata = sanitizedMetadata
+			}
+
+			// Ensure content type is set
+			if strings.HasSuffix(strings.ToLower(fullPath), ".pdf") {
+				opts.ContentType = "application/pdf"
+			} else if strings.HasSuffix(strings.ToLower(fullPath), ".docx") {
+				opts.ContentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+			} else if strings.HasSuffix(strings.ToLower(fullPath), ".zip") {
+				opts.ContentType = "application/zip"
+			}
+
+			// Upload file with retries and verification
+			objInfo, err := s.minioClient.FPutObject(
+				s.ctx,
+				s.project.Destination.Bucket,
+				destinationPath,
+				fullPath,
+				opts,
+			)
+
+			if err != nil {
+				// Log detailed error information
+				log.Printf("\nFailed to upload %s (attempt %d):\n", file.FilePath, 1)
+				log.Printf("  Local path: %s\n", fullPath)
+				log.Printf("  Destination: %s/%s\n", s.project.Destination.Bucket, destinationPath)
+				log.Printf("  Error: %v\n", err)
+
+				// Mark as failed in database
+				if err := s.db.UpdateFileStatus(s.project.Name, file.FilePath, "failed"); err != nil {
+					log.Printf("\nFailed to update status for %s: %v\n", file.FilePath, err)
 				}
+				continue
 			}
-			opts.UserMetadata = sanitizedMetadata
-		}
 
-		// Ensure content type is set
-		if strings.HasSuffix(strings.ToLower(fullPath), ".pdf") {
-			opts.ContentType = "application/pdf"
-		} else if strings.HasSuffix(strings.ToLower(fullPath), ".docx") {
-			opts.ContentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-		} else if strings.HasSuffix(strings.ToLower(fullPath), ".zip") {
-			opts.ContentType = "application/zip"
-		}
+			// Update progress
+			progress.Update(objInfo.Size, false)
+			workerProgress.update()
 
-		// Upload file with retries and verification
-		objInfo, err := s.minioClient.FPutObject(
-			context.Background(),
-			s.project.Destination.Bucket,
-			destinationPath,
-			fullPath,
-			opts,
-		)
+			// Add to completed files
+			completedFiles = append(completedFiles, file.FilePath)
 
-		if err != nil {
-			// Log detailed error information
-			log.Printf("\nFailed to upload %s (attempt %d):\n", file.FilePath, 1)
-			log.Printf("  Local path: %s\n", fullPath)
-			log.Printf("  Destination: %s/%s\n", s.project.Destination.Bucket, destinationPath)
-			log.Printf("  Error: %v\n", err)
-
-			// Mark as failed in database
-			if err := s.db.UpdateFileStatus(s.project.Name, file.FilePath, "failed"); err != nil {
-				log.Printf("\nFailed to update status for %s: %v\n", file.FilePath, err)
+			// Update database in batches
+			if len(completedFiles) >= s.batchSize {
+				if err := s.db.UpdateFilesStatus(s.project.Name, completedFiles, "uploaded"); err != nil {
+					log.Printf("\nFailed to update status for batch: %v\n", err)
+				}
+				completedFiles = nil // Reset the slice
 			}
-			continue
-		}
-
-		// Update progress
-		progress.Update(objInfo.Size, false)
-		workerProgress.update()
-
-		// Add to completed files
-		completedFiles = append(completedFiles, file.FilePath)
-
-		// Update database in batches
-		if len(completedFiles) >= s.batchSize {
-			if err := s.db.UpdateFilesStatus(s.project.Name, completedFiles, "uploaded"); err != nil {
-				log.Printf("\nFailed to update status for batch: %v\n", err)
-			}
-			completedFiles = nil // Reset the slice
 		}
 	}
 
@@ -363,9 +371,6 @@ func (s *Syncer) processWorkerFiles(id int, files []models.FileRecord, startIdx,
 			log.Printf("\nFailed to update status for final batch: %v\n", err)
 		}
 	}
-
-	// Finish the worker progress bar
-	workerProgress.finish()
 }
 
 func (s *Syncer) SyncFiles() error {
@@ -420,6 +425,56 @@ func (s *Syncer) SyncFiles() error {
 	progress.start()
 	fmt.Println() // Add a newline before worker progress bars
 
+	// Create a done channel to signal keyboard monitoring to stop
+	done := make(chan struct{})
+	defer close(done)
+
+	// Set up keyboard monitoring
+	if err := keyboard.Open(); err != nil {
+		return fmt.Errorf("failed to open keyboard: %v", err)
+	}
+	defer keyboard.Close()
+
+	// Start keyboard monitoring in a goroutine
+	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				// Ignore panic from closed keyboard
+			}
+		}()
+		
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				char, key, err := keyboard.GetKey()
+				if err != nil {
+					// Ignore keyboard errors
+					continue
+				}
+				if key == keyboard.KeyCtrlC || (char != 0 && char == 'q') {
+					fmt.Println("\nReceived stop signal. Gracefully shutting down...")
+					s.cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	// Set up signal handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt)
+	go func() {
+		select {
+		case <-sigChan:
+			fmt.Println("\nReceived interrupt signal. Gracefully shutting down...")
+			s.cancel()
+		case <-done:
+			return
+		}
+	}()
+
 	// Start workers
 	var wg sync.WaitGroup
 	for i := 0; i < s.numWorkers; i++ {
@@ -439,8 +494,21 @@ func (s *Syncer) SyncFiles() error {
 		}(i, startIdx, endIdx)
 	}
 
-	// Wait for all workers to finish
-	wg.Wait()
+	// Wait for all workers to finish or context to be cancelled
+	doneChan := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(doneChan)
+	}()
+
+	select {
+	case <-doneChan:
+		// Normal completion
+	case <-s.ctx.Done():
+		// Wait for workers to finish after cancellation
+		wg.Wait()
+		fmt.Println("\nSync process stopped. Partial progress has been saved.")
+	}
 
 	// Stop global progress bar
 	progress.finish()
@@ -499,6 +567,8 @@ func NewSyncer(db *db.DB, project *models.Project, config *SyncerConfig) (*Synce
 		config = &defaultConfig
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	// Create a transport with optimized settings for parallel uploads
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
@@ -535,13 +605,16 @@ func NewSyncer(db *db.DB, project *models.Project, config *SyncerConfig) (*Synce
 	// Set client options for better performance
 	minioClient.SetAppInfo("msync", "1.0.0")
 
-	return &Syncer{
+	s := &Syncer{
 		db:          db,
 		project:     project,
 		minioClient: minioClient,
 		numWorkers:  config.NumWorkers,
 		batchSize:   config.BatchSize,
-	}, nil
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+	return s, nil
 }
 
 func formatSpeed(bytesPerSecond float64) string {

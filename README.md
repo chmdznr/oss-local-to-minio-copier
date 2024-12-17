@@ -12,6 +12,7 @@ A command-line tool for synchronizing local directories with MinIO object storag
 - Detailed status reporting
 - CSV-based file import with metadata support
 - Rich metadata handling for uploaded files
+- Graceful shutdown support (Ctrl+C or 'q' key)
 
 ## Project Structure
 
