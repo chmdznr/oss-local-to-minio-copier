@@ -430,10 +430,16 @@ func (s *Syncer) SyncFiles() error {
 	defer close(done)
 
 	// Set up keyboard monitoring
-	if err := keyboard.Open(); err != nil {
-		return fmt.Errorf("failed to open keyboard: %v", err)
+	keyEvents, err := keyboard.GetKeys(10)
+	if err != nil {
+		return fmt.Errorf("failed to initialize keyboard: %v", err)
 	}
-	defer keyboard.Close()
+	defer func() {
+		keyboard.Close()
+		// Force restore terminal state
+		fmt.Print("\033[?25h") // Show cursor
+		fmt.Print("\033[0m")   // Reset terminal attributes
+	}()
 
 	// Start keyboard monitoring in a goroutine
 	go func() {
@@ -447,13 +453,11 @@ func (s *Syncer) SyncFiles() error {
 			select {
 			case <-done:
 				return
-			default:
-				char, key, err := keyboard.GetKey()
-				if err != nil {
-					// Ignore keyboard errors
+			case event := <-keyEvents:
+				if event.Err != nil {
 					continue
 				}
-				if key == keyboard.KeyCtrlC || (char != 0 && char == 'q') {
+				if event.Key == keyboard.KeyCtrlC || (event.Rune != 0 && event.Rune == 'q') {
 					fmt.Println("\nReceived stop signal. Gracefully shutting down...")
 					s.cancel()
 					return
