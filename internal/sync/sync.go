@@ -18,9 +18,10 @@ import (
 	"github.com/chmdznr/oss-local-to-minio-copier/internal/db"
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/models"
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/utils"
+	"github.com/eiannone/keyboard"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	"github.com/eiannone/keyboard"
+	"golang.org/x/crypto/ssh/terminal"
 	"os/signal"
 )
 
@@ -374,6 +375,20 @@ func (s *Syncer) processWorkerFiles(id int, files []models.FileRecord, startIdx,
 }
 
 func (s *Syncer) SyncFiles() error {
+	// Save current terminal state
+	oldState, err := terminal.GetState(int(os.Stdin.Fd()))
+	if err != nil {
+		// If we can't get terminal state, continue without terminal state restoration
+		oldState = nil
+	}
+
+	// Ensure terminal state is restored
+	defer func() {
+		if oldState != nil {
+			_ = terminal.Restore(int(os.Stdin.Fd()), oldState)
+		}
+	}()
+
 	files, err := s.db.GetPendingFiles(s.project.Name)
 	if err != nil {
 		return err
@@ -434,12 +449,7 @@ func (s *Syncer) SyncFiles() error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize keyboard: %v", err)
 	}
-	defer func() {
-		keyboard.Close()
-		// Force restore terminal state
-		fmt.Print("\033[?25h") // Show cursor
-		fmt.Print("\033[0m")   // Reset terminal attributes
-	}()
+	defer keyboard.Close()
 
 	// Start keyboard monitoring in a goroutine
 	go func() {
