@@ -154,10 +154,6 @@ func (p *syncProgress) updateBar() {
 	p.bar.SetCurrent(p.UploadedFiles)
 }
 
-func (p *syncProgress) Print() {
-	// This is now handled by the progress bar
-}
-
 func (p *syncProgress) start() {
 	p.bar.Start()
 }
@@ -185,61 +181,6 @@ func (p *syncProgress) getSpeed() (avgSpeed float64, currentSpeed float64) {
 	p.lastFiles = p.UploadedFiles
 
 	return avgSpeed, currentSpeed
-}
-
-func (s *Syncer) uploadFile(file models.FileRecord) error {
-	// Use the metadata map directly since it's already parsed in GetPendingFiles
-	userMetadata := file.Metadata
-	if userMetadata == nil {
-		userMetadata = make(map[string]string)
-	}
-
-	// Ensure required metadata fields exist
-	requiredFields := []string{"id_file", "id_from_csv", "id_permohonan"}
-	for _, field := range requiredFields {
-		if _, exists := userMetadata[field]; !exists {
-			// Add from FileRecord struct if available
-			switch field {
-			case "id_file":
-				if file.IDFile != "" {
-					userMetadata[field] = file.IDFile
-				}
-			case "id_from_csv":
-				if file.IDFromCSV != "" {
-					userMetadata[field] = file.IDFromCSV
-				}
-			case "id_permohonan":
-				if file.IDPermohonan != "" {
-					userMetadata[field] = file.IDPermohonan
-				}
-			}
-		}
-	}
-
-	// Open the file
-	localFile, err := os.Open(file.FilePath)
-	if err != nil {
-		return fmt.Errorf("failed to open file %s: %v", file.FilePath, err)
-	}
-	defer localFile.Close()
-
-	// Upload the file with metadata
-	_, err = s.minioClient.PutObject(
-		s.ctx,
-		s.project.Destination.Bucket,
-		file.IDFile,
-		localFile,
-		file.Size,
-		minio.PutObjectOptions{
-			UserMetadata: userMetadata,
-		},
-	)
-
-	if err != nil {
-		return fmt.Errorf("failed to upload file %s: %v", file.FilePath, err)
-	}
-
-	return nil
 }
 
 func (s *Syncer) processWorkerFiles(id int, files []models.FileRecord, startIdx, endIdx int, progress *syncProgress, workerProgress *workerProgress) {

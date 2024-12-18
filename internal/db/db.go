@@ -313,31 +313,6 @@ func (db *DB) SaveFileRecordsBatch(projectName string, records []models.FileReco
 	return tx.Commit()
 }
 
-// GetFileStats returns statistics about files in the project
-func (db *DB) GetFileStats(projectName string) (totalFiles, totalSize, uploadedFiles, uploadedSize int64, err error) {
-	// Get total files and size
-	err = db.QueryRow(`
-		SELECT COUNT(*), COALESCE(SUM(file_size), 0)
-		FROM files
-		WHERE project_name = ?
-	`, projectName).Scan(&totalFiles, &totalSize)
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-
-	// Get uploaded files and size
-	err = db.QueryRow(`
-		SELECT COUNT(*), COALESCE(SUM(file_size), 0)
-		FROM files
-		WHERE project_name = ? AND status = 'uploaded'
-	`, projectName).Scan(&uploadedFiles, &uploadedSize)
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-
-	return totalFiles, totalSize, uploadedFiles, uploadedSize, nil
-}
-
 // GetStats returns statistics about files in the project
 func (db *DB) GetStats(projectName string) (*models.Stats, error) {
 	stats := &models.Stats{}
