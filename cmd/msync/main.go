@@ -430,10 +430,22 @@ func importCSV(c *cli.Context) error {
 			// Process rows sent to this worker
 			for row := range workerChannels[workerID] {
 				rowCount++
+
+				// Safely get values with bounds checking
 				getColumnValue := func(name string) string {
 					idx := reader.HeaderIndex(name)
-					if idx < 0 || idx >= len(row.data) {
-						log.Printf("Warning: Column '%s' index out of bounds at line %d", name, row.lineNum)
+					if idx < 0 {
+						// Only log warning for optional fields
+						if name != "id" && name != "str_key" && name != "str_subkey" {
+							log.Printf("Warning: Column '%s' not found in header at line %d", name, row.lineNum)
+						}
+						return ""
+					}
+					if idx >= len(row.data) {
+						// Only log warning for optional fields
+						if name != "id" && name != "str_key" && name != "str_subkey" {
+							log.Printf("Warning: Row %d has fewer columns than expected (%d < %d)", row.lineNum, len(row.data), idx+1)
+						}
 						return ""
 					}
 					return row.data[idx]
@@ -446,13 +458,48 @@ func importCSV(c *cli.Context) error {
 					continue
 				}
 
+				idUpload := getColumnValue("id_upload")
+				if idUpload == "" {
+					result.skipCount++
+					log.Printf("Warning: Empty or invalid id_upload at line %d", row.lineNum)
+					continue
+				}
+
+				namaModul := getColumnValue("nama_modul")
+				if namaModul == "" {
+					result.skipCount++
+					log.Printf("Warning: Empty or invalid nama_modul at line %d", row.lineNum)
+					continue
+				}
+
+				fileType := getColumnValue("file_type")
+				if fileType == "" {
+					result.skipCount++
+					log.Printf("Warning: Empty or invalid file_type at line %d", row.lineNum)
+					continue
+				}
+
+				namaFileAsli := getColumnValue("nama_file_asli")
+				if namaFileAsli == "" {
+					result.skipCount++
+					log.Printf("Warning: Empty or invalid nama_file_asli at line %d", row.lineNum)
+					continue
+				}
+
+				idProfile := getColumnValue("id_profile")
+				if idProfile == "" {
+					result.skipCount++
+					log.Printf("Warning: Empty or invalid id_profile at line %d", row.lineNum)
+					continue
+				}
+
 				// Check if file exists
 				fileInfo, err := os.Stat(filepath.Join(project.SourcePath, filePath))
 				if err != nil {
 					if os.IsNotExist(err) {
 						result.skipCount++
 						dbMutex.Lock()
-						if err := db.AddMissingFile(filePath, getColumnValue("id_upload"), row.lineNum); err != nil {
+						if err := db.AddMissingFile(filePath, idUpload, row.lineNum); err != nil {
 							log.Printf("Warning: Failed to record missing file %s: %v", filePath, err)
 						}
 						dbMutex.Unlock()
@@ -463,15 +510,15 @@ func importCSV(c *cli.Context) error {
 				}
 
 				record := models.CSVRecord{
-					IDUpload:     getColumnValue("id_upload"),
+					IDUpload:     idUpload,
 					Path:         filePath,
-					NamaModul:    getColumnValue("nama_modul"),
-					FileType:     getColumnValue("file_type"),
-					NamaFileAsli: getColumnValue("nama_file_asli"),
-					IDProfile:    getColumnValue("id_profile"),
-					ID:           getColumnValue("id"),
-					StrKey:       getColumnValue("str_key"),
-					StrSubKey:    getColumnValue("str_subkey"),
+					NamaModul:    namaModul,
+					FileType:     fileType,
+					NamaFileAsli: namaFileAsli,
+					IDProfile:    idProfile,
+					ID:           getColumnValue("id"),           // Optional
+					StrKey:       getColumnValue("str_key"),      // Optional
+					StrSubKey:    getColumnValue("str_subkey"),   // Optional
 					Size:         fileInfo.Size(),
 					ModTime:      fileInfo.ModTime().Unix(),
 				}
@@ -479,23 +526,24 @@ func importCSV(c *cli.Context) error {
 				records = append(records, record)
 				result.totalSize += fileInfo.Size()
 
-				if existingFilesMap[filePath] {
-					result.updateCount++
-				} else {
-					result.newCount++
+				// Update progress bar
+				if bar != nil {
+					bar.Increment()
 				}
 
-				bar.Increment()
-
+				// Save batch if we've reached the batch size
 				if len(records) >= batchSize {
 					dbMutex.Lock()
 					if err := db.SaveFileRecordsFromCSVBatch(projectName, records); err != nil {
 						dbMutex.Unlock()
-						results <- workResult{err: fmt.Errorf("worker %d failed to save batch: %v", workerID, err)}
+						results <- workResult{err: fmt.Errorf("worker %d failed to save records: %v", workerID, err)}
 						return
 					}
 					dbMutex.Unlock()
-					records = records[:0]
+
+					// Update counts
+					result.newCount += len(records)
+					records = nil
 				}
 			}
 
@@ -785,13 +833,17 @@ func (r *excelRowReader) Close() error {
 // verifyRequiredFields checks if all required fields are present in the header
 func verifyRequiredFields(headerMap map[string]int) error {
 	requiredFields := []string{
-		"id_upload", "path", "nama_modul", "file_type",
-		"nama_file_asli", "id_profile", "id", "str_key", "str_subkey",
+		"id_upload",
+		"path",
+		"nama_modul",
+		"file_type",
+		"nama_file_asli",
+		"id_profile",
 	}
 
 	for _, field := range requiredFields {
 		if _, ok := headerMap[field]; !ok {
-			return fmt.Errorf("required field '%s' not found in file", field)
+			return fmt.Errorf("required field '%s' not found in header", field)
 		}
 	}
 	return nil
