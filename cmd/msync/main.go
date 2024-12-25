@@ -430,8 +430,19 @@ func importCSV(c *cli.Context) error {
 			// Process rows sent to this worker
 			for row := range workerChannels[workerID] {
 				rowCount++
-				filePath := row.data[reader.HeaderIndex("path")]
+				getColumnValue := func(name string) string {
+					idx := reader.HeaderIndex(name)
+					if idx < 0 || idx >= len(row.data) {
+						log.Printf("Warning: Column '%s' index out of bounds at line %d", name, row.lineNum)
+						return ""
+					}
+					return row.data[idx]
+				}
+
+				filePath := getColumnValue("path")
 				if filePath == "" {
+					result.skipCount++
+					log.Printf("Warning: Empty or invalid path at line %d", row.lineNum)
 					continue
 				}
 
@@ -441,7 +452,7 @@ func importCSV(c *cli.Context) error {
 					if os.IsNotExist(err) {
 						result.skipCount++
 						dbMutex.Lock()
-						if err := db.AddMissingFile(filePath, row.data[reader.HeaderIndex("id_upload")], row.lineNum); err != nil {
+						if err := db.AddMissingFile(filePath, getColumnValue("id_upload"), row.lineNum); err != nil {
 							log.Printf("Warning: Failed to record missing file %s: %v", filePath, err)
 						}
 						dbMutex.Unlock()
@@ -451,18 +462,16 @@ func importCSV(c *cli.Context) error {
 					return
 				}
 
-				idUpload := row.data[reader.HeaderIndex("id_upload")]
-
 				record := models.CSVRecord{
-					IDUpload:     idUpload,
+					IDUpload:     getColumnValue("id_upload"),
 					Path:         filePath,
-					NamaModul:    row.data[reader.HeaderIndex("nama_modul")],
-					FileType:     row.data[reader.HeaderIndex("file_type")],
-					NamaFileAsli: row.data[reader.HeaderIndex("nama_file_asli")],
-					IDProfile:    row.data[reader.HeaderIndex("id_profile")],
-					ID:           row.data[reader.HeaderIndex("id")],
-					StrKey:       row.data[reader.HeaderIndex("str_key")],
-					StrSubKey:    row.data[reader.HeaderIndex("str_subkey")],
+					NamaModul:    getColumnValue("nama_modul"),
+					FileType:     getColumnValue("file_type"),
+					NamaFileAsli: getColumnValue("nama_file_asli"),
+					IDProfile:    getColumnValue("id_profile"),
+					ID:           getColumnValue("id"),
+					StrKey:       getColumnValue("str_key"),
+					StrSubKey:    getColumnValue("str_subkey"),
 					Size:         fileInfo.Size(),
 					ModTime:      fileInfo.ModTime().Unix(),
 				}
@@ -516,9 +525,19 @@ func importCSV(c *cli.Context) error {
 			}
 			lineNum++ // Increment for each row read
 
-			// Find next worker that hasn't reached its quota
-			for rowsDistributed[currentWorker] >= workerRowCounts[currentWorker] {
+			// Find next available worker
+			workerFound := false
+			for attempt := 0; attempt < numWorkers; attempt++ {
+				if rowsDistributed[currentWorker] < workerRowCounts[currentWorker] {
+					workerFound = true
+					break
+				}
 				currentWorker = (currentWorker + 1) % numWorkers
+			}
+
+			if !workerFound {
+				log.Printf("Warning: No workers available for row %d, skipping", lineNum)
+				continue
 			}
 
 			workerChannels[currentWorker] <- csvRow{data: row, lineNum: lineNum}
