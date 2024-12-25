@@ -17,6 +17,7 @@ import (
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/utils"
 	"github.com/chmdznr/oss-local-to-minio-copier/pkg/version"
 	"github.com/urfave/cli/v2"
+	"github.com/xuri/excelize/v2"
 )
 
 func main() {
@@ -120,7 +121,7 @@ func main() {
 			},
 			{
 				Name:  "import",
-				Usage: "Import files from CSV",
+				Usage: "Import files from CSV or Excel",
 				Flags: []cli.Flag{
 					&cli.StringFlag{
 						Name:     "project",
@@ -129,7 +130,7 @@ func main() {
 					},
 					&cli.StringFlag{
 						Name:     "csv",
-						Usage:    "CSV file path",
+						Usage:    "CSV or Excel file path",
 						Required: true,
 					},
 					&cli.IntFlag{
@@ -277,14 +278,9 @@ func showStatus(c *cli.Context) error {
 	return nil
 }
 
-type csvRow struct {
-	data     []string
-	lineNum  int // 1-based line number in original CSV
-}
-
-// importCSV imports file records from a CSV file to the database
+// importCSV imports file records from a CSV or Excel file to the database
 //
-// The CSV file must contain the following columns:
+// The input file must contain the following columns:
 //
 // - id_upload
 // - path
@@ -296,27 +292,31 @@ type csvRow struct {
 // - str_key
 // - str_subkey
 //
-// The CSV file may contain additional columns, which will be ignored.
+// The file may contain additional columns, which will be ignored.
 //
-// The function processes the CSV file in batches of batchSize records.
+// Supported file formats:
+// - CSV (.csv)
+// - Excel (.xlsx)
+//
+// The function processes the records in batches of batchSize.
 // When the batch size is reached, the batch is saved to the database.
 // The function prints a message every time a batch is saved, indicating
 // the number of records processed so far.
 //
 // The function returns an error if the project does not exist, if the
-// CSV file is malformed, or if there is an error saving the records to
+// input file is malformed, or if there is an error saving the records to
 // the database.
 func importCSV(c *cli.Context) error {
 	projectName := c.String("project")
-	csvPath := c.String("csv")
+	inputPath := c.String("csv")
 	batchSize := c.Int("batch")
 	numWorkers := c.Int("workers")
 
 	if projectName == "" {
 		return fmt.Errorf("project name is required")
 	}
-	if csvPath == "" {
-		return fmt.Errorf("CSV file path is required")
+	if inputPath == "" {
+		return fmt.Errorf("input file path (CSV or Excel) is required")
 	}
 	if batchSize <= 0 {
 		batchSize = 1000 // default batch size
@@ -338,62 +338,23 @@ func importCSV(c *cli.Context) error {
 		return fmt.Errorf("failed to get project details: %v", err)
 	}
 
-	// Open CSV file
-	file, err := os.Open(csvPath)
+	// Detect file type by extension
+	ext := strings.ToLower(filepath.Ext(inputPath))
+	var reader rowReader
+	var totalRows int
+
+	switch ext {
+	case ".csv":
+		reader, totalRows, err = newCSVReader(inputPath)
+	case ".xlsx":
+		reader, totalRows, err = newExcelReader(inputPath)
+	default:
+		return fmt.Errorf("unsupported file format: %s (supported formats: .csv, .xlsx)", ext)
+	}
 	if err != nil {
-		return fmt.Errorf("failed to open CSV file: %v", err)
+		return fmt.Errorf("failed to create file reader: %v", err)
 	}
-	defer file.Close()
-
-	// Create CSV reader
-	reader := csv.NewReader(file)
-	reader.FieldsPerRecord = -1 // Allow variable number of fields
-
-	// Skip header row
-	header, err := reader.Read()
-	if err != nil {
-		return fmt.Errorf("failed to read CSV header: %v", err)
-	}
-
-	// Map header indices
-	headerMap := make(map[string]int)
-	for i, h := range header {
-		headerMap[strings.TrimSpace(strings.ToLower(h))] = i
-	}
-
-	// Required fields
-	requiredFields := []string{
-		"id_upload", "path", "nama_modul", "file_type",
-		"nama_file_asli", "id_profile", "id", "str_key", "str_subkey",
-	}
-
-	// Verify required fields
-	for _, field := range requiredFields {
-		if _, ok := headerMap[field]; !ok {
-			return fmt.Errorf("required field '%s' not found in CSV", field)
-		}
-	}
-
-	// Count total rows for distribution
-	totalRows := 0
-	countFile, err := os.Open(csvPath)
-	if err != nil {
-		return fmt.Errorf("failed to open CSV file for counting: %v", err)
-	}
-	countReader := csv.NewReader(countFile)
-	for {
-		_, err := countReader.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			countFile.Close()
-			return fmt.Errorf("failed to count CSV rows: %v", err)
-		}
-		totalRows++
-	}
-	countFile.Close()
-	totalRows-- // Subtract header row
+	defer reader.Close()
 
 	// Get existing files to track updates
 	existingFiles, err := db.GetProjectFiles(projectName)
@@ -469,7 +430,7 @@ func importCSV(c *cli.Context) error {
 			// Process rows sent to this worker
 			for row := range workerChannels[workerID] {
 				rowCount++
-				filePath := row.data[headerMap["path"]]
+				filePath := row.data[reader.HeaderIndex("path")]
 				if filePath == "" {
 					continue
 				}
@@ -480,7 +441,7 @@ func importCSV(c *cli.Context) error {
 					if os.IsNotExist(err) {
 						result.skipCount++
 						dbMutex.Lock()
-						if err := db.AddMissingFile(filePath, row.data[headerMap["id_upload"]], row.lineNum); err != nil {
+						if err := db.AddMissingFile(filePath, row.data[reader.HeaderIndex("id_upload")], row.lineNum); err != nil {
 							log.Printf("Warning: Failed to record missing file %s: %v", filePath, err)
 						}
 						dbMutex.Unlock()
@@ -490,18 +451,18 @@ func importCSV(c *cli.Context) error {
 					return
 				}
 
-				idUpload := row.data[headerMap["id_upload"]]
+				idUpload := row.data[reader.HeaderIndex("id_upload")]
 
 				record := models.CSVRecord{
 					IDUpload:     idUpload,
 					Path:         filePath,
-					NamaModul:    row.data[headerMap["nama_modul"]],
-					FileType:     row.data[headerMap["file_type"]],
-					NamaFileAsli: row.data[headerMap["nama_file_asli"]],
-					IDProfile:    row.data[headerMap["id_profile"]],
-					ID:           row.data[headerMap["id"]],
-					StrKey:       row.data[headerMap["str_key"]],
-					StrSubKey:    row.data[headerMap["str_subkey"]],
+					NamaModul:    row.data[reader.HeaderIndex("nama_modul")],
+					FileType:     row.data[reader.HeaderIndex("file_type")],
+					NamaFileAsli: row.data[reader.HeaderIndex("nama_file_asli")],
+					IDProfile:    row.data[reader.HeaderIndex("id_profile")],
+					ID:           row.data[reader.HeaderIndex("id")],
+					StrKey:       row.data[reader.HeaderIndex("str_key")],
+					StrSubKey:    row.data[reader.HeaderIndex("str_subkey")],
 					Size:         fileInfo.Size(),
 					ModTime:      fileInfo.ModTime().Unix(),
 				}
@@ -570,6 +531,7 @@ func importCSV(c *cli.Context) error {
 			close(ch)
 		}
 	}()
+
 	// Wait for all workers and collect results
 	go func() {
 		wg.Wait()
@@ -616,5 +578,202 @@ func importCSV(c *cli.Context) error {
 	fmt.Printf("- Existing files updated: %d\n", totalUpdatedFiles)
 	fmt.Printf("- Total size: %s\n", utils.FormatSize(totalFileSize))
 	fmt.Printf("- Skipped: %d files\n", totalSkippedFiles)
+	return nil
+}
+
+// rowReader is an interface for reading rows from different file formats
+type rowReader interface {
+	Read() ([]string, error)
+	HeaderIndex(name string) int
+	Close() error
+}
+
+// csvRow represents a row from any input file format
+type csvRow struct {
+	data     []string
+	lineNum  int // 1-based line number in original file
+}
+
+// csvRowReader implements rowReader for CSV files
+type csvRowReader struct {
+	reader     *csv.Reader
+	file       *os.File
+	headerMap  map[string]int
+}
+
+func newCSVReader(path string) (rowReader, int, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to open CSV file: %v", err)
+	}
+
+	reader := csv.NewReader(file)
+	reader.FieldsPerRecord = -1 // Allow variable number of fields
+
+	// Read header
+	header, err := reader.Read()
+	if err != nil {
+		file.Close()
+		return nil, 0, fmt.Errorf("failed to read CSV header: %v", err)
+	}
+
+	// Map header indices
+	headerMap := make(map[string]int)
+	for i, h := range header {
+		headerMap[strings.TrimSpace(strings.ToLower(h))] = i
+	}
+
+	// Verify required fields
+	if err := verifyRequiredFields(headerMap); err != nil {
+		file.Close()
+		return nil, 0, err
+	}
+
+	// Count rows
+	totalRows := 0
+	countFile, err := os.Open(path)
+	if err != nil {
+		file.Close()
+		return nil, 0, fmt.Errorf("failed to open CSV file for counting: %v", err)
+	}
+	countReader := csv.NewReader(countFile)
+	for {
+		_, err := countReader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			countFile.Close()
+			file.Close()
+			return nil, 0, fmt.Errorf("failed to count CSV rows: %v", err)
+		}
+		totalRows++
+	}
+	countFile.Close()
+	totalRows-- // Subtract header row
+
+	return &csvRowReader{
+		reader:    reader,
+		file:      file,
+		headerMap: headerMap,
+	}, totalRows, nil
+}
+
+func (r *csvRowReader) Read() ([]string, error) {
+	return r.reader.Read()
+}
+
+func (r *csvRowReader) HeaderIndex(name string) int {
+	return r.headerMap[strings.ToLower(name)]
+}
+
+func (r *csvRowReader) Close() error {
+	return r.file.Close()
+}
+
+// excelRowReader implements rowReader for Excel files
+type excelRowReader struct {
+	file      *excelize.File
+	rows      *excelize.Rows
+	headerMap map[string]int
+}
+
+func newExcelReader(path string) (rowReader, int, error) {
+	file, err := excelize.OpenFile(path)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to open Excel file: %v", err)
+	}
+
+	// Get the first sheet
+	sheets := file.GetSheetList()
+	if len(sheets) == 0 {
+		file.Close()
+		return nil, 0, fmt.Errorf("Excel file contains no sheets")
+	}
+
+	// Get rows from the first sheet
+	rows, err := file.Rows(sheets[0])
+	if err != nil {
+		file.Close()
+		return nil, 0, fmt.Errorf("failed to read Excel rows: %v", err)
+	}
+
+	// Read header row
+	if !rows.Next() {
+		file.Close()
+		return nil, 0, fmt.Errorf("Excel file is empty")
+	}
+
+	header, err := rows.Columns()
+	if err != nil {
+		file.Close()
+		return nil, 0, fmt.Errorf("failed to read Excel header: %v", err)
+	}
+
+	// Map header indices
+	headerMap := make(map[string]int)
+	for i, h := range header {
+		headerMap[strings.TrimSpace(strings.ToLower(h))] = i
+	}
+
+	// Verify required fields
+	if err := verifyRequiredFields(headerMap); err != nil {
+		file.Close()
+		return nil, 0, err
+	}
+
+	// Count total rows
+	totalRows := 0
+	countFile, err := excelize.OpenFile(path)
+	if err != nil {
+		file.Close()
+		return nil, 0, fmt.Errorf("failed to open Excel file for counting: %v", err)
+	}
+	countRows, err := countFile.Rows(sheets[0])
+	if err != nil {
+		countFile.Close()
+		file.Close()
+		return nil, 0, fmt.Errorf("failed to count Excel rows: %v", err)
+	}
+	for countRows.Next() {
+		totalRows++
+	}
+	countFile.Close()
+	totalRows-- // Subtract header row
+
+	return &excelRowReader{
+		file:      file,
+		rows:      rows,
+		headerMap: headerMap,
+	}, totalRows, nil
+}
+
+func (r *excelRowReader) Read() ([]string, error) {
+	if !r.rows.Next() {
+		return nil, io.EOF
+	}
+	return r.rows.Columns()
+}
+
+func (r *excelRowReader) HeaderIndex(name string) int {
+	return r.headerMap[strings.ToLower(name)]
+}
+
+func (r *excelRowReader) Close() error {
+	return r.file.Close()
+}
+
+// verifyRequiredFields checks if all required fields are present in the header
+func verifyRequiredFields(headerMap map[string]int) error {
+	requiredFields := []string{
+		"id_upload", "path", "nama_modul", "file_type",
+		"nama_file_asli", "id_profile", "id", "str_key", "str_subkey",
+	}
+
+	for _, field := range requiredFields {
+		if _, ok := headerMap[field]; !ok {
+			return fmt.Errorf("required field '%s' not found in file", field)
+		}
+	}
 	return nil
 }
