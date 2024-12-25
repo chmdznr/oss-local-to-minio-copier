@@ -379,6 +379,7 @@ func importCSV(c *cli.Context) error {
 	dbMutex := &sync.Mutex{} // Mutex for database operations
 
 	// Create progress bars for each worker
+	pool := pb.NewPool()
 	bars := make([]*pb.ProgressBar, numWorkers)
 	workerRowCounts := make([]int, numWorkers)
 	
@@ -394,20 +395,18 @@ func importCSV(c *cli.Context) error {
 		bars[i] = pb.New(rowCount)
 		bars[i].Set("prefix", fmt.Sprintf("Worker %d ", i))
 		bars[i].SetMaxWidth(100)
+		pool.Add(bars[i])
 	}
+
+	pool.Start()
+	defer pool.Stop()
 
 	fmt.Printf("Starting import with %d workers, processing %d rows...\n", numWorkers, totalRows)
 	for i, count := range workerRowCounts {
 		fmt.Printf("Worker %d will process %d rows\n", i, count)
 	}
 
-	pool, err := pb.StartPool(bars...)
-	if err != nil {
-		return fmt.Errorf("error creating progress pool: %v", err)
-	}
-	defer pool.Stop()
-
-	// Create channels for each worker
+	// Create channels for workers
 	workerChannels := make([]chan csvRow, numWorkers)
 	for i := range workerChannels {
 		workerChannels[i] = make(chan csvRow, numWorkers)
@@ -455,6 +454,9 @@ func importCSV(c *cli.Context) error {
 				if filePath == "" {
 					result.skipCount++
 					log.Printf("Warning: Empty or invalid path at line %d", row.lineNum)
+					if bar != nil {
+						bar.Increment()
+					}
 					continue
 				}
 
@@ -462,6 +464,9 @@ func importCSV(c *cli.Context) error {
 				if idUpload == "" {
 					result.skipCount++
 					log.Printf("Warning: Empty or invalid id_upload at line %d", row.lineNum)
+					if bar != nil {
+						bar.Increment()
+					}
 					continue
 				}
 
@@ -469,6 +474,9 @@ func importCSV(c *cli.Context) error {
 				if namaModul == "" {
 					result.skipCount++
 					log.Printf("Warning: Empty or invalid nama_modul at line %d", row.lineNum)
+					if bar != nil {
+						bar.Increment()
+					}
 					continue
 				}
 
@@ -476,6 +484,9 @@ func importCSV(c *cli.Context) error {
 				if fileType == "" {
 					result.skipCount++
 					log.Printf("Warning: Empty or invalid file_type at line %d", row.lineNum)
+					if bar != nil {
+						bar.Increment()
+					}
 					continue
 				}
 
@@ -483,6 +494,9 @@ func importCSV(c *cli.Context) error {
 				if namaFileAsli == "" {
 					result.skipCount++
 					log.Printf("Warning: Empty or invalid nama_file_asli at line %d", row.lineNum)
+					if bar != nil {
+						bar.Increment()
+					}
 					continue
 				}
 
@@ -490,6 +504,9 @@ func importCSV(c *cli.Context) error {
 				if idProfile == "" {
 					result.skipCount++
 					log.Printf("Warning: Empty or invalid id_profile at line %d", row.lineNum)
+					if bar != nil {
+						bar.Increment()
+					}
 					continue
 				}
 
@@ -503,6 +520,9 @@ func importCSV(c *cli.Context) error {
 							log.Printf("Warning: Failed to record missing file %s: %v", filePath, err)
 						}
 						dbMutex.Unlock()
+						if bar != nil {
+							bar.Increment()
+						}
 						continue
 					}
 					results <- workResult{err: fmt.Errorf("worker %d failed to stat file: %v", workerID, err)}
@@ -549,7 +569,21 @@ func importCSV(c *cli.Context) error {
 
 			// Save any remaining records
 			if len(records) > 0 {
-				result.records = records
+				dbMutex.Lock()
+				if err := db.SaveFileRecordsFromCSVBatch(projectName, records); err != nil {
+					dbMutex.Unlock()
+					results <- workResult{err: fmt.Errorf("worker %d failed to save final batch: %v", workerID, err)}
+					return
+				}
+				dbMutex.Unlock()
+				result.newCount += len(records)
+			}
+
+			// Finish progress bar
+			if bar != nil {
+				for bar.Current() < bar.Total() {
+					bar.Increment()
+				}
 			}
 
 			results <- result
