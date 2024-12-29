@@ -501,14 +501,6 @@ func importCSV(c *cli.Context) error {
 				}
 
 				idProfile := getColumnValue("id_profile")
-				if idProfile == "" {
-					result.skipCount++
-					log.Printf("Warning: Empty or invalid id_profile at line %d", row.lineNum)
-					if bar != nil {
-						bar.Increment()
-					}
-					continue
-				}
 
 				// Check if file exists
 				fileInfo, err := os.Stat(filepath.Join(project.SourcePath, filePath))
@@ -872,7 +864,6 @@ func verifyRequiredFields(headerMap map[string]int) error {
 		"nama_modul",
 		"file_type",
 		"nama_file_asli",
-		"id_profile",
 	}
 
 	for _, field := range requiredFields {

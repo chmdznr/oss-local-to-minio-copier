@@ -109,13 +109,15 @@ msync create --name <project-name> --source <source-dir> --endpoint <minio-endpo
 msync import --project <project-name> --csv <csv-file> [--batch <batch-size>]
 ```
 
-The import command processes a CSV file containing file information. The CSV must include these columns:
+The import command processes a CSV file containing file information. The CSV must include these required columns:
 - `id_upload`: Unique identifier for the upload
 - `path`: Relative path to the file
 - `nama_modul`: Module name
 - `file_type`: Type of file
 - `nama_file_asli`: Original file name
-- `id_profile`: Profile ID
+
+Optional columns:
+- `id_profile`: Profile ID (can be empty)
 - `id`: Unique identifier (preserved as existing_id)
 - `str_key`: String key
 - `str_subkey`: String subkey
@@ -169,7 +171,7 @@ The following metadata is stored for each file:
 - `path`: Original file path
 - `nama_modul`: Module name from CSV
 - `nama_file_asli`: Original file name from CSV
-- `id_profile`: Profile ID from CSV
+- `id_profile`: Profile ID from CSV (if provided)
 - `bucket`: Full bucket path including destination folder
 - `existing_id`: Original ID from CSV
 
